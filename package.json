@@ -1,4 +1,37 @@
 {
+  "name": "redis-sentinel",
+  "version": "0.1.0",
+  "description": "Small Node.js Redis Sentinel wrapper with topology discovery, read/write routing, and background failover reconciliation.",
+  "main": "index.js",
+  "private": true,
+  "author": "azizzaeny",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/kbm-development/redis-sentinel.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kbm-development/redis-sentinel/issues"
+  },
+  "homepage": "https://github.com/kbm-development/redis-sentinel#readme",
+  "keywords": [
+    "redis",
+    "sentinel",
+    "node-redis",
+    "failover",
+    "replica",
+    "read-write-routing"
+  ],
+  "files": [
+    "index.js",
+    "readme.md"
+  ],
+  "scripts": {
+    "test": "node test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "redis": "^5.12.1"
   }
