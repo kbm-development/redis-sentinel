@@ -1252,6 +1252,189 @@ test('foreground command still fails once during failover transition without ret
     assert.equal(attempts, 1)
 })
 
+test('scenario: direct mode works without sentinel state', async () => {
+    var calls = []
+    var fakeClient = {
+        connect: async () => calls.push('connect direct'),
+        sendCommand: async (args) => {
+            calls.push(args)
+            return 'direct-value'
+        },
+        close: async () => calls.push('close direct')
+    }
+    var context = createInitialContext('redis://redis.local:6379')
+    context = await connectDirect(context, () => fakeClient)
+    var result = await command(['GET', 'key'], context)
+
+    assert.equal(context.sentinel, undefined)
+    assert.equal(result, 'direct-value')
+    assert.deepEqual(calls, ['connect direct', ['GET', 'key']])
+})
+
+test('scenario: sentinel outage after startup does not stop active data traffic', async () => {
+    var dataCalls = []
+    var context = Object.freeze({
+        mode: 'sentinel',
+        masterName: 'mymaster',
+        sentinel: {
+            sendCommand: async () => {
+                throw new Error('sentinel unavailable')
+            }
+        },
+        master: {
+            key: 'master:6379',
+            status: 'up',
+            client: {
+                sendCommand: async (args) => {
+                    dataCalls.push(args)
+                    return 'ok'
+                }
+            }
+        },
+        replicas: Object.freeze([])
+    })
+    var reconciled = await reconcileTopology(context)
+    var result = await command(['SET', 'key', 'value'], reconciled)
+
+    assert.equal(reconciled.sentinelStatus, 'suspect')
+    assert.equal(result, 'ok')
+    assert.deepEqual(dataCalls, [['SET', 'key', 'value']])
+})
+
+test('scenario: master failover promotes replica without full reconnect', async () => {
+    var calls = []
+    var oldMasterClient = { close: async () => calls.push('close old master') }
+    var existingReplicaClient = { close: async () => calls.push('close existing replica') }
+    var newMasterClient = { connect: async () => calls.push('connect promoted replica') }
+    var context = Object.freeze({
+        mode: 'sentinel',
+        master: { key: 'old-master:6379', client: oldMasterClient, status: 'suspect' },
+        replicas: Object.freeze([
+            { key: 'new-master:6379', client: existingReplicaClient, status: 'up' }
+        ])
+    })
+    var topology = Object.freeze({
+        master: { host: 'new-master', port: 6379, key: 'new-master:6379' },
+        replicas: Object.freeze([{ host: 'old-master', port: 6379, key: 'old-master:6379' }])
+    })
+    var result = await handlePossibleMasterFailover(context, {
+        topology,
+        createClient: () => newMasterClient
+    })
+
+    assert.deepEqual(calls, ['connect promoted replica', 'close existing replica'])
+    assert.equal(result.master.key, 'new-master:6379')
+    assert.equal(result.replicas[0].key, 'old-master:6379')
+    assert.equal(result.replicas[0].client, oldMasterClient)
+})
+
+test('scenario: one replica down does not affect other replica reads', async () => {
+    var calls = []
+    var context = Object.freeze({
+        mode: 'sentinel',
+        master: {
+            status: 'up',
+            client: { sendCommand: async args => calls.push(['master', args]) }
+        },
+        replicas: Object.freeze([
+            { key: 'replica-a:6379', status: 'down', client: { sendCommand: async args => calls.push(['replica-a', args]) } },
+            { key: 'replica-b:6379', status: 'up', client: { sendCommand: async args => {
+                calls.push(['replica-b', args])
+                return 'value'
+            } } }
+        ])
+    })
+    var result = await command(['GET', 'key'], context)
+
+    assert.equal(result, 'value')
+    assert.deepEqual(calls, [['replica-b', ['GET', 'key']]])
+})
+
+test('scenario: replica returns and becomes eligible for reads again', async () => {
+    var calls = []
+    var context = Object.freeze({
+        mode: 'sentinel',
+        master: {
+            status: 'up',
+            client: { sendCommand: async args => calls.push(['master', args]) }
+        },
+        replicas: Object.freeze([
+            {
+                key: 'replica-a:6379',
+                status: 'down',
+                failures: 2,
+                retry: { attempt: 2, delay: 200, next: 1200 },
+                client: {
+                    sendCommand: async args => {
+                        calls.push(['replica-a', args])
+                        return 'value'
+                    }
+                }
+            }
+        ])
+    })
+    var healed = markContextConnectionSuccess(context, { replicaKey: 'replica-a:6379' })
+    var result = await command(['GET', 'key'], healed)
+
+    assert.equal(healed.replicas[0].status, 'up')
+    assert.equal(result, 'value')
+    assert.deepEqual(calls, [['replica-a', ['GET', 'key']]])
+})
+
+test('scenario: all redis data nodes down makes foreground commands fail while healing can continue', async () => {
+    var writeAttempts = 0
+    var context = Object.freeze({
+        mode: 'sentinel',
+        masterName: 'mymaster',
+        sentinel: {
+            sendCommand: async (args) => {
+                if (args[1] === 'get-master-addr-by-name') return ['master', '6379']
+                return []
+            }
+        },
+        master: {
+            key: 'master:6379',
+            status: 'up',
+            client: {
+                sendCommand: async () => {
+                    writeAttempts += 1
+                    throw new Error('redis down')
+                }
+            }
+        },
+        replicas: Object.freeze([])
+    })
+    var reconciled = await reconcileTopology(context)
+
+    await assert.rejects(() => command(['SET', 'key', 'value'], reconciled), /redis down/)
+    assert.equal(writeAttempts, 1)
+    assert.equal(reconciled.master, context.master)
+})
+
+test('scenario: topology query uses sentinel commands only and no info calls', async () => {
+    var commands = []
+    var context = Object.freeze({
+        mode: 'sentinel',
+        masterName: 'mymaster',
+        sentinel: {
+            sendCommand: async (args) => {
+                commands.push(args)
+                if (args[1] === 'get-master-addr-by-name') return ['master', '6379']
+                return []
+            }
+        },
+        master: { key: 'master:6379', client: {}, status: 'up' },
+        replicas: Object.freeze([])
+    })
+
+    await reconcileTopology(context)
+
+    assert.deepEqual(commands, [
+        ['SENTINEL', 'get-master-addr-by-name', 'mymaster'],
+        ['SENTINEL', 'replicas', 'mymaster']
+    ])
+})
+
 test('reconcileTopology returns same context for unchanged topology', async () => {
     var sentCommands = []
     var context = Object.freeze({
