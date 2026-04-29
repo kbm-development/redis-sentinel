@@ -118,12 +118,14 @@ var createInitialContext = (uri, options = {}) => {
 
 var createRedisClient = (options) => redis.createClient(options)
 
-var createConnectionRecord = (role, key, client) => {
+var createConnectionRecord = (role, key, client, node = {}, status = 'up') => {
     return Object.freeze({
         key,
         role,
+        host: node.host,
+        port: node.port,
         client,
-        status: 'up',
+        status,
         failures: 0,
         retry: Object.freeze({
             attempt: 0,
@@ -131,6 +133,46 @@ var createConnectionRecord = (role, key, client) => {
             next: 0
         })
     })
+}
+
+var createDownConnectionRecord = (role, node) => {
+    return Object.freeze({
+        key: node.key,
+        role,
+        host: node.host,
+        port: node.port,
+        client: undefined,
+        status: 'down',
+        failures: 1,
+        retry: Object.freeze({
+            attempt: 1,
+            delay: 0,
+            next: 0
+        })
+    })
+}
+
+var createRedisNodeClientOptions = (node, context) => {
+    return {
+        socket: {
+            host: node.host,
+            port: node.port
+        },
+        username: context.username,
+        password: context.password
+    }
+}
+
+var connectRedisNode = async (role, node, context, createClient = createRedisClient) => {
+    var client = createClient(createRedisNodeClientOptions(node, context))
+
+    try {
+        await client.connect()
+        return createConnectionRecord(role, node.key, client, node)
+    } catch (err) {
+        await closeClient(client)
+        throw err
+    }
 }
 
 var connectDirect = async (context, createClient = createRedisClient) => {
@@ -288,6 +330,37 @@ var discoverTopology = async (context) => {
     })
 }
 
+var connectReplicaNode = async (node, context, createClient) => {
+    try {
+        return await connectRedisNode('replica', node, context, createClient)
+    } catch (err) {
+        return createDownConnectionRecord('replica', node)
+    }
+}
+
+var connectTopology = async (context, createClient = createRedisClient) => {
+    if (!context || context.mode !== 'sentinel') {
+        throw new Error('connectTopology requires a sentinel redis context')
+    }
+
+    if (!context.topology || !context.topology.master) {
+        throw new Error('connectTopology requires discovered topology')
+    }
+
+    var master = await connectRedisNode('master', context.topology.master, context, createClient)
+    var replicas = []
+
+    for (var replica of context.topology.replicas || []) {
+        replicas.push(await connectReplicaNode(replica, context, createClient))
+    }
+
+    return Object.freeze({
+        ...context,
+        master,
+        replicas: Object.freeze(replicas)
+    })
+}
+
 var getDirectClient = (context) => {
     if (!context || context.mode !== 'direct') {
         throw new Error('direct command requires a direct redis context')
@@ -341,6 +414,9 @@ module.exports = {
     parsePort,
     createRedisClient,
     createConnectionRecord,
+    createDownConnectionRecord,
+    createRedisNodeClientOptions,
+    connectRedisNode,
     connectDirect,
     createSentinelClientOptions,
     connectSentinel,
@@ -350,6 +426,7 @@ module.exports = {
     discoverMaster,
     discoverReplicas,
     discoverTopology,
+    connectTopology,
     command,
     closeRedisContext
 }
