@@ -39,10 +39,24 @@ This library is a small wrapper around `node-redis`. Sentinel is used as the dis
 - No dependency-heavy abstraction.
 - No hidden `client.get()` / `client.set()` API wrapping.
 
+## Install
+
+Install directly from the public GitHub repository:
+
+```sh
+npm install github:kbm-development/redis-sentinel
+```
+
+Or with the full Git URL:
+
+```sh
+npm install git+https://github.com/kbm-development/redis-sentinel.git
+```
+
 ## Usage
 
 ```js
-var { createRedis, command, closeRedis } = require('./index')
+var { createRedis, command, closeRedis } = require('redis-sentinel')
 
 var redis = await createRedis(process.env.REDIS_URL)
 
@@ -89,3 +103,7 @@ The Sentinel URI points to Sentinel nodes, not Redis master or replica nodes.
 ## Deployment Note
 
 Redis replicas may need `replica-announce-ip` configured so Sentinel returns addresses reachable by the Node.js application.
+
+## License
+
+MIT
