@@ -979,6 +979,8 @@ var chooseReplica = (context) => {
 }
 
 var getCommandClient = (args, context) => {
+    context = getActiveContext(context)
+
     if (context.mode === 'direct') return getDirectClient(context)
 
     if (context.mode !== 'sentinel') {
@@ -992,6 +994,11 @@ var getCommandClient = (args, context) => {
     }
 
     return getMasterClient(context)
+}
+
+var getActiveContext = (context) => {
+    if (context && typeof context.getContext === 'function') return context.getContext()
+    return context
 }
 
 var command = async (args, context) => {
@@ -1014,6 +1021,14 @@ var closeClient = async (client) => {
 var closeRedisContext = async (context) => {
     if (!context) return
 
+    var hasSentinelEvents = Boolean(context.sentinelEvents)
+
+    if (context.topologyReconciler) context.topologyReconciler.stop()
+    if (context.sentinelHealer) context.sentinelHealer.stop()
+    if (context.sentinelEvents) await context.sentinelEvents.stop()
+
+    context = getActiveContext(context)
+
     if (context.master) await closeClient(context.master.client)
 
     for (var replica of context.replicas || []) {
@@ -1021,10 +1036,56 @@ var closeRedisContext = async (context) => {
     }
 
     await closeClient(context.sentinel)
-    await closeClient(context.sentinelSubscriber)
+    if (!hasSentinelEvents) await closeClient(context.sentinelSubscriber)
 }
 
+var attachBackground = async (context, options = {}) => {
+    if (options.background === false || context.mode !== 'sentinel') return context
+
+    var createClient = options.createClient || createRedisClient
+    var dataCreateClient = options.dataCreateClient || createClient
+    var topologyReconciler = createTopologyReconciler(context, {
+        ...options,
+        createClient: dataCreateClient
+    })
+    var sentinelHealer = createSentinelHealer(context, {
+        ...options,
+        createClient,
+        dataCreateClient
+    })
+    var sentinelEvents = await createSentinelEventSubscription(context, topologyReconciler, {
+        ...options,
+        createClient
+    })
+
+    return Object.freeze({
+        ...context,
+        sentinelSubscriber: sentinelEvents.context.sentinelSubscriber,
+        topologyReconciler,
+        sentinelHealer,
+        sentinelEvents,
+        getContext: () => topologyReconciler.getContext()
+    })
+}
+
+var createRedis = async (uri, options = {}) => {
+    var createClient = options.createClient || createRedisClient
+    var dataCreateClient = options.dataCreateClient || createClient
+    var context = createInitialContext(uri, options)
+
+    if (context.mode === 'direct') return connectDirect(context, createClient)
+
+    context = await connectSentinel(context, createClient)
+    context = await discoverTopology(context)
+    context = await connectTopology(context, dataCreateClient)
+    return attachBackground(context, options)
+}
+
+var closeRedis = async (context) => closeRedisContext(context)
+
 module.exports = {
+    createRedis,
+    closeRedis,
     parseRedisUrl,
     createInitialContext,
     parseSentinelNode,
@@ -1097,6 +1158,8 @@ module.exports = {
     isHealthyConnection,
     chooseReplica,
     getCommandClient,
+    getActiveContext,
+    attachBackground,
     command,
     closeRedisContext
 }
