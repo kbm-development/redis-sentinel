@@ -11,7 +11,10 @@ var assertString = (value, name) => {
 }
 
 var parsePort = (value, defaultPort, label) => {
-    if (value == null || value === '') return defaultPort
+    if (value == null || value === '') {
+        if (defaultPort == null) throw new Error(`${label} port must be a valid TCP port`)
+        return defaultPort
+    }
 
     var port = Number(value)
     if (!Number.isInteger(port) || port <= 0 || port > 65535) {
@@ -183,6 +186,108 @@ var connectSentinel = async (context, createClient = createRedisClient) => {
     throw error
 }
 
+var createNodeKey = (host, port) => `${host}:${port}`
+
+var normalizeMaster = (reply) => {
+    if (!Array.isArray(reply) || reply.length < 2) {
+        throw new Error('invalid sentinel master response')
+    }
+
+    var host = reply[0]
+    var port = parsePort(reply[1], undefined, 'master')
+
+    if (!host) throw new Error('invalid sentinel master host')
+
+    return Object.freeze({
+        host,
+        port,
+        key: createNodeKey(host, port)
+    })
+}
+
+var sentinelArrayToObject = (values) => {
+    var result = {}
+
+    for (var i = 0; i < values.length; i += 2) {
+        result[values[i]] = values[i + 1]
+    }
+
+    return result
+}
+
+var isReplicaDown = (replica) => {
+    var flags = String(replica.flags || '')
+    return flags.split(',').includes('s_down') || flags.split(',').includes('o_down')
+}
+
+var normalizeReplica = (reply) => {
+    var replica = Array.isArray(reply) ? sentinelArrayToObject(reply) : reply
+    var host = replica.ip || replica.host
+    var port = parsePort(replica.port, undefined, 'replica')
+
+    if (!host) throw new Error('invalid sentinel replica host')
+
+    return Object.freeze({
+        host,
+        port,
+        key: createNodeKey(host, port)
+    })
+}
+
+var normalizeReplicas = (reply) => {
+    if (!Array.isArray(reply)) throw new Error('invalid sentinel replicas response')
+
+    return Object.freeze(reply
+        .map(item => Array.isArray(item) ? sentinelArrayToObject(item) : item)
+        .filter(item => !isReplicaDown(item))
+        .map(normalizeReplica))
+}
+
+var getSentinelClient = (context) => {
+    if (!context || context.mode !== 'sentinel') {
+        throw new Error('sentinel discovery requires a sentinel redis context')
+    }
+
+    if (!context.sentinel) {
+        throw new Error('sentinel redis context is not connected')
+    }
+
+    return context.sentinel
+}
+
+var discoverMaster = async (context) => {
+    var client = getSentinelClient(context)
+    var reply = await client.sendCommand([
+        'SENTINEL',
+        'get-master-addr-by-name',
+        context.masterName
+    ])
+
+    return normalizeMaster(reply)
+}
+
+var discoverReplicas = async (context) => {
+    var client = getSentinelClient(context)
+    var reply = await client.sendCommand([
+        'SENTINEL',
+        'replicas',
+        context.masterName
+    ])
+
+    return normalizeReplicas(reply)
+}
+
+var discoverTopology = async (context) => {
+    var master = await discoverMaster(context)
+    var replicas = await discoverReplicas(context)
+    var topology = Object.freeze({ master, replicas })
+
+    return Object.freeze({
+        ...context,
+        topology
+    })
+}
+
 var getDirectClient = (context) => {
     if (!context || context.mode !== 'direct') {
         throw new Error('direct command requires a direct redis context')
@@ -239,6 +344,12 @@ module.exports = {
     connectDirect,
     createSentinelClientOptions,
     connectSentinel,
+    createNodeKey,
+    normalizeMaster,
+    normalizeReplicas,
+    discoverMaster,
+    discoverReplicas,
+    discoverTopology,
     command,
     closeRedisContext
 }
