@@ -19,4 +19,52 @@ Create a Redis Sentinel aware library using `node-redis` with these behaviors:
 - Keep implementation functional, small, and dependency-light.
 
 
+## Connection String Shape
+
+Direct Redis mode:
+
+```text
+redis://host:port
+```
+
+Sentinel mode:
+
+```text
+redis+sentinel://host1:26379,host2:26379,host3:26379?sentinelMasterId=mymaster
+```
+
+Optional auth form:
+
+```text
+redis+sentinel://username:password@host1:26379,host2:26379?sentinelMasterId=mymaster
+```
+
+The Sentinel URI points to Sentinel nodes, not Redis master or replica nodes.
+
+## Target State Shape
+
+The context should eventually contain:
+
+- `mode`: `direct` or `sentinel`
+- `sentinels`: configured Sentinel candidates
+- `sentinel`: currently active Sentinel command connection
+- `sentinelSubscriber`: active Sentinel event subscription connection
+- `masterName`: Sentinel master name
+- `username` / `password`: Redis auth options
+- `master`: current master connection record
+- `replicas`: current replica connection records
+- `topology`: last known topology snapshot
+- `timers`: background reconciliation / health timers
+- `options`: intervals, thresholds, backoff config
+
+Each Redis node connection record should eventually contain:
+
+- `key`: stable `host:port` key
+- `role`: `master` or `replica`
+- `host`
+- `port`
+- `client`
+- `status`: `up`, `suspect`, `down`, `connecting`, or `closed`
+- `failures`
+- `retry`: per-connection retry state
 
