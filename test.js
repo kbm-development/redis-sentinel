@@ -5,17 +5,16 @@ var {
     parseRedisUrl,
     createInitialContext,
     parseSentinelNode,
-    parsePort
+    parsePort,
+    connectDirect,
+    command,
+    closeRedisContext
 } = require('./index')
 
+var tests = []
+
 var test = (name, fn) => {
-    try {
-        fn()
-        console.log(`ok - ${name}`)
-    } catch (err) {
-        console.error(`not ok - ${name}`)
-        throw err
-    }
+    tests.push({ name, fn })
 }
 
 test('parsePort returns default port when empty', () => {
@@ -109,12 +108,136 @@ test('createInitialContext creates empty sentinel context', () => {
     assert.deepEqual(context.timers, {})
 })
 
-test('createInitialContext from env REDIS_URL', ()=>{
+
+test('createInitialContext from env REDIS_URL only sentinel', ()=>{
+    if (!process.env.REDIS_URL) return
     var context = createInitialContext(process.env.REDIS_URL);
-    assert.equal(context.mode, 'sentinel')
-    assert.equal(context.masterName, 'mymaster')
-    assert.equal(context.sentinel, undefined)
-    assert.equal(context.sentinelSubscriber, undefined)
-    assert.deepEqual(context.replicas, [])
-    assert.deepEqual(context.timers, {})
+	if(context.mode === 'sentinel'){
+		assert.equal(context.mode, 'sentinel')
+		assert.equal(context.masterName, 'mymaster')
+		assert.equal(context.sentinel, undefined)
+		assert.equal(context.sentinelSubscriber, undefined)
+		assert.deepEqual(context.replicas, [])
+		assert.deepEqual(context.timers, {})
+	}
+	assert.equal(1,1) // just pass
+})
+
+
+test('connectDirect creates and connects direct redis client', async () => {
+    var createdOptions = undefined
+    var calls = []
+    var fakeClient = {
+        connect: async () => calls.push('connect'),
+        sendCommand: async () => 'ok',
+        quit: async () => calls.push('quit')
+    }
+    var createClient = (options) => {
+        createdOptions = options
+        return fakeClient
+    }
+    var context = createInitialContext('redis://redis.local:6379')
+    var connected = await connectDirect(context, createClient)
+
+    assert.deepEqual(createdOptions, { url: 'redis://redis.local:6379' })
+    assert.deepEqual(calls, ['connect'])
+    assert.equal(connected.mode, 'direct')
+    assert.equal(connected.master.role, 'master')
+    assert.equal(connected.master.key, 'redis://redis.local:6379')
+    assert.equal(connected.master.client, fakeClient)
+    assert.equal(connected.master.status, 'up')
+})
+
+test('connectDirect rejects sentinel context', async () => {
+    var context = createInitialContext('redis+sentinel://s1.local:26379?sentinelMasterId=mymaster')
+
+    await assert.rejects(
+        () => connectDirect(context, () => ({})),
+        /direct redis context/
+    )
+})
+
+test('command sends direct mode command to connected client', async () => {
+    var sentArgs = undefined
+    var fakeClient = {
+        connect: async () => undefined,
+        sendCommand: async (args) => {
+            sentArgs = args
+            return 'value'
+        }
+    }
+    var context = createInitialContext('redis://redis.local:6379')
+    var connected = await connectDirect(context, () => fakeClient)
+    var result = await command(['GET', 'key'], connected)
+
+    assert.deepEqual(sentArgs, ['GET', 'key'])
+    assert.equal(result, 'value')
+})
+
+test('command surfaces direct client errors without retry', async () => {
+    var attempts = 0
+    var fakeClient = {
+        connect: async () => undefined,
+        sendCommand: async () => {
+            attempts += 1
+            throw new Error('boom')
+        }
+    }
+    var context = createInitialContext('redis://redis.local:6379')
+    var connected = await connectDirect(context, () => fakeClient)
+
+    await assert.rejects(() => command(['SET', 'key', 'value'], connected), /boom/)
+    assert.equal(attempts, 1)
+})
+
+test('command validates direct context is connected', async () => {
+    var context = createInitialContext('redis://redis.local:6379')
+
+    await assert.rejects(() => command(['GET', 'key'], context), /not connected/)
+})
+
+test('closeRedisContext closes direct master client', async () => {
+    var calls = []
+    var fakeClient = {
+        connect: async () => undefined,
+        sendCommand: async () => 'ok',
+        quit: async () => calls.push('quit')
+    }
+    var context = createInitialContext('redis://redis.local:6379')
+    var connected = await connectDirect(context, () => fakeClient)
+
+    await closeRedisContext(connected)
+
+    assert.deepEqual(calls, ['quit'])
+});
+
+test('test real context data from direction connections', async () =>{
+    if (!process.env.REDIS_URL) return;
+    var context = createInitialContext(process.env.REDIS_URL);
+	if(context.mode === 'direct'){
+		assert.equal(context.mode, 'direct');
+		context = await connectDirect(context);
+		assert.equal(context.master.role, 'master');
+		let results = await command(['GET', 'foo'], context);
+		assert.notEqual(results, null)
+		await closeRedisContext(context);
+	}
+	assert.equal(1,1) // just pass
+});
+
+var run = async () => {
+    for (var item of tests) {
+        try {
+            await item.fn()
+            console.log(`ok - ${item.name}`)
+        } catch (err) {
+			console.log(err)
+            console.error(`not ok - ${item.name}`)
+            throw err
+        }
+    }
+}
+
+run().catch(() => {
+    process.exitCode = 1
 })

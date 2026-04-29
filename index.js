@@ -1,5 +1,7 @@
 'use strict'
 
+var redis = require('redis')
+
 var SENTINEL_PROTOCOL = 'redis+sentinel://'
 
 var assertString = (value, name) => {
@@ -111,9 +113,89 @@ var createInitialContext = (uri, options = {}) => {
     })
 }
 
+var createRedisClient = (options) => redis.createClient(options)
+
+var createConnectionRecord = (role, key, client) => {
+    return Object.freeze({
+        key,
+        role,
+        client,
+        status: 'up',
+        failures: 0,
+        retry: Object.freeze({
+            attempt: 0,
+            delay: 0,
+            next: 0
+        })
+    })
+}
+
+var connectDirect = async (context, createClient = createRedisClient) => {
+    if (!context || context.mode !== 'direct') {
+        throw new Error('connectDirect requires a direct redis context')
+    }
+
+    var client = createClient({ url: context.uri })
+    await client.connect()
+
+    return Object.freeze({
+        ...context,
+        master: createConnectionRecord('master', context.uri, client)
+    })
+}
+
+var getDirectClient = (context) => {
+    if (!context || context.mode !== 'direct') {
+        throw new Error('direct command requires a direct redis context')
+    }
+
+    if (!context.master || !context.master.client) {
+        throw new Error('direct redis context is not connected')
+    }
+
+    return context.master.client
+}
+
+var command = async (args, context) => {
+    if (!Array.isArray(args) || args.length === 0) {
+        throw new Error('command args must be a non-empty array')
+    }
+
+    if (context.mode === 'direct') {
+        var client = getDirectClient(context)
+        return client.sendCommand(args)
+    }
+
+    throw new Error('sentinel command routing is not implemented yet')
+}
+
+var closeClient = async (client) => {
+    if (!client) return
+    if (typeof client.quit === 'function') return client.quit()
+    if (typeof client.disconnect === 'function') return client.disconnect()
+}
+
+var closeRedisContext = async (context) => {
+    if (!context) return
+
+    if (context.master) await closeClient(context.master.client)
+
+    for (var replica of context.replicas || []) {
+        await closeClient(replica.client)
+    }
+
+    await closeClient(context.sentinel)
+    await closeClient(context.sentinelSubscriber)
+}
+
 module.exports = {
     parseRedisUrl,
     createInitialContext,
     parseSentinelNode,
-    parsePort
+    parsePort,
+    createRedisClient,
+    createConnectionRecord,
+    connectDirect,
+    command,
+    closeRedisContext
 }
