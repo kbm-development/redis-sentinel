@@ -432,6 +432,91 @@ var connectTopology = async (context, createClient = createRedisClient) => {
     })
 }
 
+var indexConnectionsByKey = (connections = []) => {
+    var byKey = new Map()
+
+    for (var connection of connections) {
+        byKey.set(connection.key, connection)
+    }
+
+    return byKey
+}
+
+var sameKeys = (left = [], right = []) => {
+    if (left.length !== right.length) return false
+
+    var leftKeys = left.map(item => item.key).sort()
+    var rightKeys = right.map(item => item.key).sort()
+
+    for (var i = 0; i < leftKeys.length; i += 1) {
+        if (leftKeys[i] !== rightKeys[i]) return false
+    }
+
+    return true
+}
+
+var isSameTopology = (context, nextTopology) => {
+    if (!context.master || !nextTopology || !nextTopology.master) return false
+    if (context.master.key !== nextTopology.master.key) return false
+
+    return sameKeys(context.replicas || [], nextTopology.replicas || [])
+}
+
+var closeRemovedConnections = async (connections, keepKeys) => {
+    for (var connection of connections || []) {
+        if (!keepKeys.has(connection.key)) await closeClient(connection.client)
+    }
+}
+
+var applyTopology = async (context, nextTopology, createClient = createRedisClient) => {
+    if (!context || context.mode !== 'sentinel') {
+        throw new Error('applyTopology requires a sentinel redis context')
+    }
+
+    if (!nextTopology || !nextTopology.master) {
+        throw new Error('applyTopology requires discovered topology')
+    }
+
+    if (isSameTopology(context, nextTopology)) return context
+
+    var replicaNodes = nextTopology.replicas || []
+    var replicaKeys = new Set(replicaNodes.map(replica => replica.key))
+    var currentReplicas = context.replicas || []
+    var currentReplicasByKey = indexConnectionsByKey(currentReplicas)
+    var masterChanged = !context.master || context.master.key !== nextTopology.master.key
+    var oldMaster = context.master
+    var master = masterChanged
+        ? await connectRedisNode('master', nextTopology.master, context, createClient)
+        : context.master
+    var replicas = []
+
+    for (var replica of replicaNodes) {
+        if (currentReplicasByKey.has(replica.key)) {
+            replicas.push(currentReplicasByKey.get(replica.key))
+        } else if (masterChanged && oldMaster && oldMaster.key === replica.key) {
+            replicas.push(createConnectionRecord('replica', oldMaster.key, oldMaster.client, replica, oldMaster.status))
+        } else {
+            replicas.push(await connectReplicaNode(replica, context, createClient))
+        }
+    }
+
+    await closeRemovedConnections(currentReplicas, replicaKeys)
+
+    if (masterChanged && oldMaster && !replicaKeys.has(oldMaster.key)) {
+        await closeClient(oldMaster.client)
+    }
+
+    return Object.freeze({
+        ...context,
+        master,
+        replicas: Object.freeze(replicas),
+        topology: Object.freeze({
+            master: nextTopology.master,
+            replicas: Object.freeze(replicaNodes)
+        })
+    })
+}
+
 var getDirectClient = (context) => {
     if (!context || context.mode !== 'direct') {
         throw new Error('direct command requires a direct redis context')
@@ -538,6 +623,10 @@ module.exports = {
     discoverReplicas,
     discoverTopology,
     connectTopology,
+    indexConnectionsByKey,
+    sameKeys,
+    isSameTopology,
+    applyTopology,
     READ_COMMANDS,
     WRITE_COMMANDS,
     classifyCommand,

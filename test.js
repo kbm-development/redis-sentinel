@@ -17,6 +17,7 @@ var {
     createRedisNodeClientOptions,
     connectRedisNode,
     connectTopology,
+    applyTopology,
     classifyCommand,
     chooseReplica,
     command,
@@ -575,6 +576,145 @@ test('connectTopology requires discovered topology', async () => {
     var context = createInitialContext('redis+sentinel://s1.local:26379?sentinelMasterId=mymaster')
 
     await assert.rejects(() => connectTopology(context, () => ({})), /discovered topology/)
+})
+
+test('applyTopology returns same context when topology is unchanged', async () => {
+    var context = Object.freeze({
+        mode: 'sentinel',
+        master: { key: 'master:6379', client: {}, status: 'up' },
+        replicas: Object.freeze([{ key: 'replica-a:6379', client: {}, status: 'up' }])
+    })
+    var topology = Object.freeze({
+        master: { host: 'master', port: 6379, key: 'master:6379' },
+        replicas: Object.freeze([{ host: 'replica-a', port: 6379, key: 'replica-a:6379' }])
+    })
+    var result = await applyTopology(context, topology, () => {
+        throw new Error('should not connect')
+    })
+
+    assert.equal(result, context)
+})
+
+test('applyTopology connects only added replicas', async () => {
+    var calls = []
+    var existingReplicaClient = { close: async () => calls.push('close existing replica') }
+    var newReplicaClient = {
+        connect: async () => calls.push('connect new replica'),
+        close: async () => calls.push('close new replica')
+    }
+    var context = Object.freeze({
+        mode: 'sentinel',
+        master: { key: 'master:6379', client: {}, status: 'up' },
+        replicas: Object.freeze([
+            { key: 'replica-a:6379', client: existingReplicaClient, status: 'up' }
+        ])
+    })
+    var topology = Object.freeze({
+        master: { host: 'master', port: 6379, key: 'master:6379' },
+        replicas: Object.freeze([
+            { host: 'replica-a', port: 6379, key: 'replica-a:6379' },
+            { host: 'replica-b', port: 6379, key: 'replica-b:6379' }
+        ])
+    })
+    var result = await applyTopology(context, topology, () => newReplicaClient)
+
+    assert.deepEqual(calls, ['connect new replica'])
+    assert.equal(result.master, context.master)
+    assert.equal(result.replicas.length, 2)
+    assert.equal(result.replicas[0], context.replicas[0])
+    assert.equal(result.replicas[1].key, 'replica-b:6379')
+    assert.equal(result.replicas[1].client, newReplicaClient)
+})
+
+test('applyTopology closes removed replicas', async () => {
+    var calls = []
+    var keepReplicaClient = { close: async () => calls.push('close keep replica') }
+    var removedReplicaClient = { close: async () => calls.push('close removed replica') }
+    var context = Object.freeze({
+        mode: 'sentinel',
+        master: { key: 'master:6379', client: {}, status: 'up' },
+        replicas: Object.freeze([
+            { key: 'replica-a:6379', client: keepReplicaClient, status: 'up' },
+            { key: 'replica-b:6379', client: removedReplicaClient, status: 'up' }
+        ])
+    })
+    var topology = Object.freeze({
+        master: { host: 'master', port: 6379, key: 'master:6379' },
+        replicas: Object.freeze([{ host: 'replica-a', port: 6379, key: 'replica-a:6379' }])
+    })
+    var result = await applyTopology(context, topology, () => {
+        throw new Error('should not connect')
+    })
+
+    assert.deepEqual(calls, ['close removed replica'])
+    assert.equal(result.replicas.length, 1)
+    assert.equal(result.replicas[0], context.replicas[0])
+})
+
+test('applyTopology connects new master before closing old master', async () => {
+    var calls = []
+    var oldMasterClient = { close: async () => calls.push('close old master') }
+    var newMasterClient = { connect: async () => calls.push('connect new master') }
+    var context = Object.freeze({
+        mode: 'sentinel',
+        master: { key: 'old-master:6379', client: oldMasterClient, status: 'up' },
+        replicas: Object.freeze([])
+    })
+    var topology = Object.freeze({
+        master: { host: 'new-master', port: 6379, key: 'new-master:6379' },
+        replicas: Object.freeze([])
+    })
+    var result = await applyTopology(context, topology, () => newMasterClient)
+
+    assert.deepEqual(calls, ['connect new master', 'close old master'])
+    assert.equal(result.master.key, 'new-master:6379')
+    assert.equal(result.master.client, newMasterClient)
+})
+
+test('applyTopology keeps old master when it becomes a replica', async () => {
+    var calls = []
+    var oldMasterClient = { close: async () => calls.push('close old master') }
+    var newMasterClient = { connect: async () => calls.push('connect new master') }
+    var context = Object.freeze({
+        mode: 'sentinel',
+        master: { key: 'old-master:6379', client: oldMasterClient, status: 'up' },
+        replicas: Object.freeze([])
+    })
+    var topology = Object.freeze({
+        master: { host: 'new-master', port: 6379, key: 'new-master:6379' },
+        replicas: Object.freeze([{ host: 'old-master', port: 6379, key: 'old-master:6379' }])
+    })
+    var result = await applyTopology(context, topology, () => newMasterClient)
+
+    assert.deepEqual(calls, ['connect new master'])
+    assert.equal(result.master.key, 'new-master:6379')
+    assert.equal(result.replicas.length, 1)
+    assert.equal(result.replicas[0].role, 'replica')
+    assert.equal(result.replicas[0].client, oldMasterClient)
+})
+
+test('applyTopology does not close old master when new master connection fails', async () => {
+    var calls = []
+    var oldMasterClient = { close: async () => calls.push('close old master') }
+    var failedNewMasterClient = {
+        connect: async () => {
+            calls.push('connect new master')
+            throw new Error('new master failed')
+        },
+        close: async () => calls.push('close failed new master')
+    }
+    var context = Object.freeze({
+        mode: 'sentinel',
+        master: { key: 'old-master:6379', client: oldMasterClient, status: 'up' },
+        replicas: Object.freeze([])
+    })
+    var topology = Object.freeze({
+        master: { host: 'new-master', port: 6379, key: 'new-master:6379' },
+        replicas: Object.freeze([])
+    })
+
+    await assert.rejects(() => applyTopology(context, topology, () => failedNewMasterClient), /new master failed/)
+    assert.deepEqual(calls, ['connect new master', 'close failed new master'])
 })
 
 test('classifyCommand classifies reads, writes, and unknown commands', () => {
