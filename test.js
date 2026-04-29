@@ -14,6 +14,14 @@ var {
     discoverMaster,
     discoverReplicas,
     discoverTopology,
+    getBackoffDelay,
+    nextRetryState,
+    markConnectionFailure,
+    markConnectionSuccess,
+    canRetryNow,
+    createClientHealthRecord,
+    markContextConnectionFailure,
+    markContextConnectionSuccess,
     createRedisNodeClientOptions,
     connectRedisNode,
     connectTopology,
@@ -248,6 +256,165 @@ test('closeRedisContext prefers socket close over quit command', async () => {
 
     assert.deepEqual(calls, ['close'])
 });
+
+test('markConnectionFailure marks first failure suspect', () => {
+    var connection = {
+        key: 'replica-a:6379',
+        role: 'replica',
+        client: {},
+        status: 'up',
+        failures: 0,
+        retry: { attempt: 0, delay: 0, next: 0 }
+    }
+    var result = markConnectionFailure(connection, {
+        failureThreshold: 2,
+        baseDelay: 100,
+        maxDelay: 1000,
+        now: 1000
+    })
+
+    assert.equal(result.status, 'suspect')
+    assert.equal(result.failures, 1)
+    assert.deepEqual(result.retry, { attempt: 1, delay: 100, next: 1100 })
+})
+
+test('markConnectionFailure marks repeated failure down', () => {
+    var connection = {
+        key: 'replica-a:6379',
+        role: 'replica',
+        client: {},
+        status: 'suspect',
+        failures: 1,
+        retry: { attempt: 1, delay: 100, next: 1100 }
+    }
+    var result = markConnectionFailure(connection, {
+        failureThreshold: 2,
+        baseDelay: 100,
+        maxDelay: 1000,
+        now: 2000
+    })
+
+    assert.equal(result.status, 'down')
+    assert.equal(result.failures, 2)
+    assert.deepEqual(result.retry, { attempt: 2, delay: 200, next: 2200 })
+})
+
+test('markConnectionSuccess resets health and retry state', () => {
+    var connection = {
+        key: 'replica-a:6379',
+        role: 'replica',
+        client: {},
+        status: 'down',
+        failures: 3,
+        retry: { attempt: 3, delay: 400, next: 1400 }
+    }
+    var result = markConnectionSuccess(connection)
+
+    assert.equal(result.status, 'up')
+    assert.equal(result.failures, 0)
+    assert.deepEqual(result.retry, { attempt: 0, delay: 0, next: 0 })
+})
+
+test('nextRetryState uses bounded exponential backoff', () => {
+    assert.deepEqual(nextRetryState({ attempt: 0 }, { baseDelay: 100, maxDelay: 250, now: 1000 }), {
+        attempt: 1,
+        delay: 100,
+        next: 1100
+    })
+    assert.deepEqual(nextRetryState({ attempt: 2 }, { baseDelay: 100, maxDelay: 250, now: 1000 }), {
+        attempt: 3,
+        delay: 250,
+        next: 1250
+    })
+    assert.equal(getBackoffDelay(10, { baseDelay: 100, maxDelay: 500 }), 500)
+})
+
+test('canRetryNow checks per-connection retry time', () => {
+    assert.equal(canRetryNow({ retry: { next: 1000 } }, 999), false)
+    assert.equal(canRetryNow({ retry: { next: 1000 } }, 1000), true)
+    assert.equal(canRetryNow({ retry: { next: 0 } }, 1), true)
+})
+
+test('context health updates are independent per connection', () => {
+    var context = Object.freeze({
+        master: {
+            key: 'master:6379',
+            role: 'master',
+            client: {},
+            status: 'up',
+            failures: 0,
+            retry: { attempt: 0, delay: 0, next: 0 }
+        },
+        replicas: Object.freeze([
+            {
+                key: 'replica-a:6379',
+                role: 'replica',
+                client: {},
+                status: 'up',
+                failures: 0,
+                retry: { attempt: 0, delay: 0, next: 0 }
+            },
+            {
+                key: 'replica-b:6379',
+                role: 'replica',
+                client: {},
+                status: 'up',
+                failures: 0,
+                retry: { attempt: 0, delay: 0, next: 0 }
+            }
+        ])
+    })
+    var result = markContextConnectionFailure(context, { replicaKey: 'replica-a:6379' }, {
+        failureThreshold: 2,
+        baseDelay: 100,
+        maxDelay: 1000,
+        now: 1000
+    })
+
+    assert.equal(result.master, context.master)
+    assert.equal(result.replicas[0].status, 'suspect')
+    assert.equal(result.replicas[1], context.replicas[1])
+    assert.notEqual(result.replicas[0].retry, context.replicas[0].retry)
+})
+
+test('context health tracks sentinel and subscriber separately', () => {
+    var sentinelClient = {}
+    var subscriberClient = {}
+    var context = Object.freeze({
+        sentinel: sentinelClient,
+        sentinelSubscriber: subscriberClient
+    })
+    var failedSentinel = markContextConnectionFailure(context, 'sentinel', {
+        failureThreshold: 2,
+        baseDelay: 100,
+        maxDelay: 1000,
+        now: 1000
+    })
+    var failedSubscriber = markContextConnectionFailure(failedSentinel, 'sentinelSubscriber', {
+        failureThreshold: 2,
+        baseDelay: 200,
+        maxDelay: 1000,
+        now: 1000
+    })
+    var healedSentinel = markContextConnectionSuccess(failedSubscriber, 'sentinel')
+
+    assert.equal(failedSubscriber.sentinelHealth.status, 'suspect')
+    assert.equal(failedSubscriber.sentinelSubscriberHealth.status, 'suspect')
+    assert.deepEqual(failedSubscriber.sentinelHealth.retry, { attempt: 1, delay: 100, next: 1100 })
+    assert.deepEqual(failedSubscriber.sentinelSubscriberHealth.retry, { attempt: 1, delay: 200, next: 1200 })
+    assert.equal(healedSentinel.sentinelHealth.status, 'up')
+    assert.equal(healedSentinel.sentinelSubscriberHealth.status, 'suspect')
+})
+
+test('createClientHealthRecord stores client health state', () => {
+    var client = {}
+    var health = createClientHealthRecord('sentinel', client)
+
+    assert.equal(health.key, 'sentinel')
+    assert.equal(health.role, 'sentinel')
+    assert.equal(health.client, client)
+    assert.equal(health.status, 'up')
+})
 
 test('createSentinelClientOptions creates node redis sentinel socket options', () => {
     var context = createInitialContext('redis+sentinel://user:pass@s1.local:26379?sentinelMasterId=mymaster')

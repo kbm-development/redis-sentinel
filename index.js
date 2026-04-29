@@ -215,6 +215,101 @@ var createConnectionRecord = (role, key, client, node = {}, status = 'up') => {
     })
 }
 
+var getHealthOptions = (options = {}) => Object.freeze({
+    failureThreshold: options.failureThreshold || 2,
+    baseDelay: options.baseDelay || 100,
+    maxDelay: options.maxDelay || 5000,
+    now: options.now || Date.now()
+})
+
+var createRetryState = (attempt = 0, delay = 0, next = 0) => Object.freeze({
+    attempt,
+    delay,
+    next
+})
+
+var getBackoffDelay = (attempt, options = {}) => {
+    var healthOptions = getHealthOptions(options)
+    var delay = healthOptions.baseDelay * Math.pow(2, Math.max(0, attempt - 1))
+
+    return Math.min(delay, healthOptions.maxDelay)
+}
+
+var nextRetryState = (retry = {}, options = {}) => {
+    var healthOptions = getHealthOptions(options)
+    var attempt = (retry.attempt || 0) + 1
+    var delay = getBackoffDelay(attempt, healthOptions)
+
+    return createRetryState(attempt, delay, healthOptions.now + delay)
+}
+
+var markConnectionFailure = (connection, options = {}) => {
+    var healthOptions = getHealthOptions(options)
+    var failures = (connection.failures || 0) + 1
+    var status = failures >= healthOptions.failureThreshold ? 'down' : 'suspect'
+
+    return Object.freeze({
+        ...connection,
+        status,
+        failures,
+        retry: nextRetryState(connection.retry, healthOptions)
+    })
+}
+
+var markConnectionSuccess = (connection) => {
+    return Object.freeze({
+        ...connection,
+        status: 'up',
+        failures: 0,
+        retry: createRetryState()
+    })
+}
+
+var canRetryNow = (connection, now = Date.now()) => {
+    return !connection.retry || !connection.retry.next || connection.retry.next <= now
+}
+
+var createClientHealthRecord = (role, client, status = 'up') => createConnectionRecord(role, role, client, {}, status)
+
+var getContextHealthRecord = (context, target) => {
+    if (target === 'master') return context.master
+    if (target === 'sentinel') return context.sentinelHealth || createClientHealthRecord('sentinel', context.sentinel)
+    if (target === 'sentinelSubscriber') return context.sentinelSubscriberHealth || createClientHealthRecord('sentinelSubscriber', context.sentinelSubscriber)
+    if (target && target.replicaKey) return (context.replicas || []).find(replica => replica.key === target.replicaKey)
+    return undefined
+}
+
+var setContextHealthRecord = (context, target, record) => {
+    if (target === 'master') return Object.freeze({ ...context, master: record })
+    if (target === 'sentinel') return Object.freeze({ ...context, sentinelHealth: record })
+    if (target === 'sentinelSubscriber') return Object.freeze({ ...context, sentinelSubscriberHealth: record })
+    if (target && target.replicaKey) {
+        return Object.freeze({
+            ...context,
+            replicas: Object.freeze((context.replicas || []).map(replica => {
+                if (replica.key === target.replicaKey) return record
+                return replica
+            }))
+        })
+    }
+
+    throw new Error('unknown health target')
+}
+
+var markContextConnectionFailure = (context, target, options = {}) => {
+    var record = getContextHealthRecord(context, target)
+    if (!record) throw new Error('health target not found')
+
+    return setContextHealthRecord(context, target, markConnectionFailure(record, options))
+}
+
+var markContextConnectionSuccess = (context, target) => {
+    var record = getContextHealthRecord(context, target)
+    if (!record) throw new Error('health target not found')
+
+    return setContextHealthRecord(context, target, markConnectionSuccess(record))
+}
+
 var createDownConnectionRecord = (role, node) => {
     return Object.freeze({
         key: node.key,
@@ -773,6 +868,18 @@ module.exports = {
     parsePort,
     createRedisClient,
     createConnectionRecord,
+    getHealthOptions,
+    createRetryState,
+    getBackoffDelay,
+    nextRetryState,
+    markConnectionFailure,
+    markConnectionSuccess,
+    canRetryNow,
+    createClientHealthRecord,
+    getContextHealthRecord,
+    setContextHealthRecord,
+    markContextConnectionFailure,
+    markContextConnectionSuccess,
     createDownConnectionRecord,
     createRedisNodeClientOptions,
     connectRedisNode,
