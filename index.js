@@ -517,6 +517,73 @@ var applyTopology = async (context, nextTopology, createClient = createRedisClie
     })
 }
 
+var markSentinelSuspect = (context, err) => {
+    return Object.freeze({
+        ...context,
+        sentinelStatus: 'suspect',
+        lastReconcileError: err
+    })
+}
+
+var markSentinelUp = (context) => {
+    return Object.freeze({
+        ...context,
+        sentinelStatus: 'up',
+        lastReconcileError: undefined
+    })
+}
+
+var reconcileTopology = async (context, createClient = createRedisClient) => {
+    try {
+        var discovered = await discoverTopology(context)
+        var applied = await applyTopology(context, discovered.topology, createClient)
+
+        if (applied === context) return context
+        return markSentinelUp(applied)
+    } catch (err) {
+        return markSentinelSuspect(context, err)
+    }
+}
+
+var createScheduler = () => ({
+    setInterval: (fn, ms) => setInterval(fn, ms),
+    clearInterval: timer => clearInterval(timer)
+})
+
+var getReconcileInterval = (context, options = {}) => {
+    return options.intervalMs || context.options.topologyIntervalMs || 5000
+}
+
+var createTopologyReconciler = (context, options = {}) => {
+    var current = context
+    var running = false
+    var scheduler = options.scheduler || createScheduler()
+    var createClient = options.createClient || createRedisClient
+    var intervalMs = getReconcileInterval(context, options)
+    var reconcile = async () => {
+        if (running) return current
+
+        running = true
+        try {
+            current = await reconcileTopology(current, createClient)
+            return current
+        } finally {
+            running = false
+        }
+    }
+    var timer = scheduler.setInterval(() => {
+        reconcile().catch(() => undefined)
+    }, intervalMs)
+
+    return Object.freeze({
+        getContext: () => current,
+        reconcile,
+        stop: () => scheduler.clearInterval(timer),
+        timer,
+        intervalMs
+    })
+}
+
 var getDirectClient = (context) => {
     if (!context || context.mode !== 'direct') {
         throw new Error('direct command requires a direct redis context')
@@ -627,6 +694,12 @@ module.exports = {
     sameKeys,
     isSameTopology,
     applyTopology,
+    markSentinelSuspect,
+    markSentinelUp,
+    reconcileTopology,
+    createScheduler,
+    getReconcileInterval,
+    createTopologyReconciler,
     READ_COMMANDS,
     WRITE_COMMANDS,
     classifyCommand,
