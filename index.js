@@ -4,6 +4,15 @@ var redis = require('redis')
 
 var SENTINEL_PROTOCOL = 'redis+sentinel://'
 
+var SENTINEL_TOPOLOGY_EVENTS = new Set([
+    '+switch-master',
+    '+slave',
+    '+sdown',
+    '-sdown',
+    '+odown',
+    '+failover-end'
+])
+
 var READ_COMMANDS = new Set([
     'GET', 'MGET', 'GETRANGE', 'STRLEN',
     'EXISTS', 'TTL', 'PTTL',
@@ -547,7 +556,9 @@ var reconcileTopology = async (context, createClient = createRedisClient) => {
 
 var createScheduler = () => ({
     setInterval: (fn, ms) => setInterval(fn, ms),
-    clearInterval: timer => clearInterval(timer)
+    clearInterval: timer => clearInterval(timer),
+    setTimeout: (fn, ms) => setTimeout(fn, ms),
+    clearTimeout: timer => clearTimeout(timer)
 })
 
 var getReconcileInterval = (context, options = {}) => {
@@ -581,6 +592,91 @@ var createTopologyReconciler = (context, options = {}) => {
         stop: () => scheduler.clearInterval(timer),
         timer,
         intervalMs
+    })
+}
+
+var isSentinelTopologyEvent = (channel) => SENTINEL_TOPOLOGY_EVENTS.has(channel)
+
+var getSentinelTopologyChannels = () => Object.freeze(Array.from(SENTINEL_TOPOLOGY_EVENTS))
+
+var connectSentinelSubscriber = async (context, createClient = createRedisClient) => {
+    if (!context || context.mode !== 'sentinel') {
+        throw new Error('connectSentinelSubscriber requires a sentinel redis context')
+    }
+
+    var lastError = undefined
+
+    for (var sentinel of context.sentinels) {
+        var client = createClient(createSentinelClientOptions(sentinel, context))
+
+        try {
+            await client.connect()
+
+            return Object.freeze({
+                ...context,
+                sentinelSubscriber: client
+            })
+        } catch (err) {
+            lastError = err
+            await closeClient(client)
+        }
+    }
+
+    var error = new Error('Cannot connect sentinel subscriber, no sentinel available')
+    error.cause = lastError
+    throw error
+}
+
+var subscribeSentinelChannel = async (client, onEvent, channel) => {
+    return client.subscribe(channel, message => onEvent(channel, message))
+}
+
+var subscribeSentinelChannels = async (client, onEvent, channels = getSentinelTopologyChannels()) => {
+    for (var channel of channels) {
+        await subscribeSentinelChannel(client, onEvent, channel)
+    }
+}
+
+var createDebouncedReconcile = (reconcile, debounceMs, scheduler = createScheduler()) => {
+    var timer = undefined
+    var schedule = () => {
+        if (timer) scheduler.clearTimeout(timer)
+
+        timer = scheduler.setTimeout(() => {
+            timer = undefined
+            reconcile().catch(() => undefined)
+        }, debounceMs)
+    }
+    var cancel = () => {
+        if (!timer) return
+        scheduler.clearTimeout(timer)
+        timer = undefined
+    }
+
+    return Object.freeze({ schedule, cancel })
+}
+
+var createSentinelEventSubscription = async (context, reconciler, options = {}) => {
+    var createClient = options.createClient || createRedisClient
+    var scheduler = options.scheduler || createScheduler()
+    var debounceMs = options.debounceMs || 250
+    var nextContext = context.sentinelSubscriber
+        ? context
+        : await connectSentinelSubscriber(context, createClient)
+    var debounced = createDebouncedReconcile(reconciler.reconcile, debounceMs, scheduler)
+    var onEvent = (channel, message) => {
+        if (!isSentinelTopologyEvent(channel)) return
+        debounced.schedule(message)
+    }
+
+    await subscribeSentinelChannels(nextContext.sentinelSubscriber, onEvent, options.channels)
+
+    return Object.freeze({
+        context: nextContext,
+        stop: async () => {
+            debounced.cancel()
+            await closeClient(nextContext.sentinelSubscriber)
+        }
     })
 }
 
@@ -700,6 +796,14 @@ module.exports = {
     createScheduler,
     getReconcileInterval,
     createTopologyReconciler,
+    SENTINEL_TOPOLOGY_EVENTS,
+    isSentinelTopologyEvent,
+    getSentinelTopologyChannels,
+    connectSentinelSubscriber,
+    subscribeSentinelChannel,
+    subscribeSentinelChannels,
+    createDebouncedReconcile,
+    createSentinelEventSubscription,
     READ_COMMANDS,
     WRITE_COMMANDS,
     classifyCommand,

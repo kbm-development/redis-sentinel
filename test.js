@@ -21,6 +21,12 @@ var {
     reconcileTopology,
     getReconcileInterval,
     createTopologyReconciler,
+    isSentinelTopologyEvent,
+    getSentinelTopologyChannels,
+    connectSentinelSubscriber,
+    subscribeSentinelChannels,
+    createDebouncedReconcile,
+    createSentinelEventSubscription,
     classifyCommand,
     chooseReplica,
     command,
@@ -846,6 +852,123 @@ test('createTopologyReconciler starts timer and updates current context', async 
     reconciler.stop()
 
     assert.equal(cleared, 'timer-1')
+})
+
+test('isSentinelTopologyEvent recognizes relevant sentinel events only', () => {
+    assert.equal(isSentinelTopologyEvent('+switch-master'), true)
+    assert.equal(isSentinelTopologyEvent('+slave'), true)
+    assert.equal(isSentinelTopologyEvent('+sdown'), true)
+    assert.equal(isSentinelTopologyEvent('-sdown'), true)
+    assert.equal(isSentinelTopologyEvent('+odown'), true)
+    assert.equal(isSentinelTopologyEvent('+failover-end'), true)
+    assert.equal(isSentinelTopologyEvent('+monitor'), false)
+})
+
+test('connectSentinelSubscriber connects separate sentinel subscriber client', async () => {
+    var calls = []
+    var fakeClient = {
+        connect: async () => calls.push('connect subscriber')
+    }
+    var context = createInitialContext('redis+sentinel://s1.local:26379?sentinelMasterId=mymaster')
+    var connected = await connectSentinelSubscriber(context, () => fakeClient)
+
+    assert.deepEqual(calls, ['connect subscriber'])
+    assert.equal(connected.sentinelSubscriber, fakeClient)
+    assert.equal(connected.sentinel, undefined)
+})
+
+test('subscribeSentinelChannels subscribes to topology channels', async () => {
+    var subscribed = []
+    var callbacks = {}
+    var client = {
+        subscribe: async (channel, callback) => {
+            subscribed.push(channel)
+            callbacks[channel] = callback
+        }
+    }
+    var events = []
+
+    await subscribeSentinelChannels(client, (channel, message) => events.push({ channel, message }))
+
+    assert.deepEqual(subscribed, getSentinelTopologyChannels())
+
+    callbacks['+switch-master']('payload')
+
+    assert.deepEqual(events, [{ channel: '+switch-master', message: 'payload' }])
+})
+
+test('createDebouncedReconcile collapses multiple schedules into one reconcile', () => {
+    var calls = []
+    var timers = []
+    var cleared = []
+    var scheduler = {
+        setTimeout: (fn, ms) => {
+            var timer = { fn, ms }
+            timers.push(timer)
+            return timer
+        },
+        clearTimeout: timer => cleared.push(timer)
+    }
+    var debounced = createDebouncedReconcile(async () => calls.push('reconcile'), 250, scheduler)
+
+    debounced.schedule()
+    debounced.schedule()
+
+    assert.equal(timers.length, 2)
+    assert.deepEqual(cleared, [timers[0]])
+
+    timers[1].fn()
+
+    assert.deepEqual(calls, ['reconcile'])
+})
+
+test('createSentinelEventSubscription debounces relevant events and ignores unrelated events', async () => {
+    var calls = []
+    var callbacks = {}
+    var timers = []
+    var cleared = []
+    var subscriberClient = {
+        connect: async () => calls.push('connect subscriber'),
+        subscribe: async (channel, callback) => {
+            callbacks[channel] = callback
+        },
+        close: async () => calls.push('close subscriber')
+    }
+    var scheduler = {
+        setTimeout: (fn, ms) => {
+            var timer = { fn, ms }
+            timers.push(timer)
+            return timer
+        },
+        clearTimeout: timer => cleared.push(timer)
+    }
+    var reconciler = {
+        reconcile: async () => calls.push('reconcile')
+    }
+    var context = createInitialContext('redis+sentinel://s1.local:26379?sentinelMasterId=mymaster')
+    var subscription = await createSentinelEventSubscription(context, reconciler, {
+        createClient: () => subscriberClient,
+        scheduler,
+        debounceMs: 50,
+        channels: ['+switch-master', '+slave']
+    })
+
+    assert.equal(subscription.context.sentinelSubscriber, subscriberClient)
+    assert.deepEqual(calls, ['connect subscriber'])
+
+    callbacks['+switch-master']('payload-1')
+    callbacks['+slave']('payload-2')
+
+    assert.equal(timers.length, 2)
+    assert.deepEqual(cleared, [timers[0]])
+
+    timers[1].fn()
+
+    assert.deepEqual(calls, ['connect subscriber', 'reconcile'])
+
+    await subscription.stop()
+
+    assert.deepEqual(calls, ['connect subscriber', 'reconcile', 'close subscriber'])
 })
 
 test('classifyCommand classifies reads, writes, and unknown commands', () => {
