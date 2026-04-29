@@ -755,6 +755,35 @@ var applyTopology = async (context, nextTopology, createClient = createRedisClie
     })
 }
 
+var isMasterChanged = (context, topology) => {
+    return Boolean(context.master && topology && topology.master && context.master.key !== topology.master.key)
+}
+
+var isMasterUnhealthy = (context) => {
+    return Boolean(context.master && (context.master.status === 'suspect' || context.master.status === 'down'))
+}
+
+var confirmMasterTopology = async (context) => {
+    var discovered = await discoverTopology(context)
+    return discovered.topology
+}
+
+var handleMasterFailover = async (context, options = {}) => {
+    if (!context || context.mode !== 'sentinel') {
+        throw new Error('handleMasterFailover requires a sentinel redis context')
+    }
+
+    var topology = options.topology || await confirmMasterTopology(context)
+    if (!isMasterChanged(context, topology)) return context
+
+    return applyTopology(context, topology, options.createClient || createRedisClient)
+}
+
+var handlePossibleMasterFailover = async (context, options = {}) => {
+    if (!options.force && !isMasterUnhealthy(context)) return context
+    return handleMasterFailover(context, options)
+}
+
 var markSentinelSuspect = (context, err) => {
     return Object.freeze({
         ...context,
@@ -1043,6 +1072,11 @@ module.exports = {
     sameKeys,
     isSameTopology,
     applyTopology,
+    isMasterChanged,
+    isMasterUnhealthy,
+    confirmMasterTopology,
+    handleMasterFailover,
+    handlePossibleMasterFailover,
     markSentinelSuspect,
     markSentinelUp,
     reconcileTopology,

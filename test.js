@@ -26,6 +26,10 @@ var {
     connectRedisNode,
     connectTopology,
     applyTopology,
+    isMasterChanged,
+    isMasterUnhealthy,
+    handleMasterFailover,
+    handlePossibleMasterFailover,
     reconcileTopology,
     getReconcileInterval,
     createTopologyReconciler,
@@ -1097,6 +1101,155 @@ test('applyTopology does not close old master when new master connection fails',
 
     await assert.rejects(() => applyTopology(context, topology, () => failedNewMasterClient), /new master failed/)
     assert.deepEqual(calls, ['connect new master', 'close failed new master'])
+})
+
+test('isMasterChanged detects confirmed master key changes', () => {
+    var context = { master: { key: 'old-master:6379' } }
+
+    assert.equal(isMasterChanged(context, { master: { key: 'new-master:6379' } }), true)
+    assert.equal(isMasterChanged(context, { master: { key: 'old-master:6379' } }), false)
+})
+
+test('isMasterUnhealthy detects suspect and down master', () => {
+    assert.equal(isMasterUnhealthy({ master: { status: 'up' } }), false)
+    assert.equal(isMasterUnhealthy({ master: { status: 'suspect' } }), true)
+    assert.equal(isMasterUnhealthy({ master: { status: 'down' } }), true)
+})
+
+test('handleMasterFailover returns same context when sentinel confirms same master', async () => {
+    var context = Object.freeze({
+        mode: 'sentinel',
+        master: { key: 'master:6379', client: {}, status: 'up' },
+        replicas: Object.freeze([])
+    })
+    var topology = Object.freeze({
+        master: { host: 'master', port: 6379, key: 'master:6379' },
+        replicas: Object.freeze([])
+    })
+    var result = await handleMasterFailover(context, {
+        topology,
+        createClient: () => {
+            throw new Error('should not connect')
+        }
+    })
+
+    assert.equal(result, context)
+})
+
+test('handleMasterFailover connects new master and closes old master after swap', async () => {
+    var calls = []
+    var oldMasterClient = { close: async () => calls.push('close old master') }
+    var newMasterClient = { connect: async () => calls.push('connect new master') }
+    var context = Object.freeze({
+        mode: 'sentinel',
+        master: { key: 'old-master:6379', client: oldMasterClient, status: 'up' },
+        replicas: Object.freeze([])
+    })
+    var topology = Object.freeze({
+        master: { host: 'new-master', port: 6379, key: 'new-master:6379' },
+        replicas: Object.freeze([])
+    })
+    var result = await handleMasterFailover(context, {
+        topology,
+        createClient: () => newMasterClient
+    })
+
+    assert.deepEqual(calls, ['connect new master', 'close old master'])
+    assert.equal(result.master.key, 'new-master:6379')
+    assert.equal(result.master.client, newMasterClient)
+})
+
+test('handleMasterFailover keeps old master when sentinel reports it as replica', async () => {
+    var calls = []
+    var oldMasterClient = { close: async () => calls.push('close old master') }
+    var newMasterClient = { connect: async () => calls.push('connect new master') }
+    var context = Object.freeze({
+        mode: 'sentinel',
+        master: { key: 'old-master:6379', client: oldMasterClient, status: 'up' },
+        replicas: Object.freeze([])
+    })
+    var topology = Object.freeze({
+        master: { host: 'new-master', port: 6379, key: 'new-master:6379' },
+        replicas: Object.freeze([{ host: 'old-master', port: 6379, key: 'old-master:6379' }])
+    })
+    var result = await handleMasterFailover(context, {
+        topology,
+        createClient: () => newMasterClient
+    })
+
+    assert.deepEqual(calls, ['connect new master'])
+    assert.equal(result.master.key, 'new-master:6379')
+    assert.equal(result.replicas[0].role, 'replica')
+    assert.equal(result.replicas[0].client, oldMasterClient)
+})
+
+test('handleMasterFailover does not close old master when new master connect fails', async () => {
+    var calls = []
+    var oldMasterClient = { close: async () => calls.push('close old master') }
+    var failedNewMasterClient = {
+        connect: async () => {
+            calls.push('connect new master')
+            throw new Error('new master failed')
+        },
+        close: async () => calls.push('close failed new master')
+    }
+    var context = Object.freeze({
+        mode: 'sentinel',
+        master: { key: 'old-master:6379', client: oldMasterClient, status: 'up' },
+        replicas: Object.freeze([])
+    })
+    var topology = Object.freeze({
+        master: { host: 'new-master', port: 6379, key: 'new-master:6379' },
+        replicas: Object.freeze([])
+    })
+
+    await assert.rejects(() => handleMasterFailover(context, {
+        topology,
+        createClient: () => failedNewMasterClient
+    }), /new master failed/)
+    assert.deepEqual(calls, ['connect new master', 'close failed new master'])
+})
+
+test('handlePossibleMasterFailover only checks when forced or master unhealthy', async () => {
+    var healthy = Object.freeze({
+        mode: 'sentinel',
+        master: { key: 'master:6379', client: {}, status: 'up' },
+        replicas: Object.freeze([])
+    })
+    var suspect = Object.freeze({
+        mode: 'sentinel',
+        master: { key: 'master:6379', client: {}, status: 'suspect' },
+        replicas: Object.freeze([])
+    })
+    var topology = Object.freeze({
+        master: { host: 'master', port: 6379, key: 'master:6379' },
+        replicas: Object.freeze([])
+    })
+
+    assert.equal(await handlePossibleMasterFailover(healthy, { topology }), healthy)
+    assert.equal(await handlePossibleMasterFailover(suspect, { topology }), suspect)
+    assert.equal(await handlePossibleMasterFailover(healthy, { force: true, topology }), healthy)
+})
+
+test('foreground command still fails once during failover transition without retry', async () => {
+    var attempts = 0
+    var context = Object.freeze({
+        mode: 'sentinel',
+        master: {
+            key: 'old-master:6379',
+            status: 'up',
+            client: {
+                sendCommand: async () => {
+                    attempts += 1
+                    throw new Error('old master write failed')
+                }
+            }
+        },
+        replicas: Object.freeze([])
+    })
+
+    await assert.rejects(() => command(['SET', 'key', 'value'], context), /old master write failed/)
+    assert.equal(attempts, 1)
 })
 
 test('reconcileTopology returns same context for unchanged topology', async () => {
