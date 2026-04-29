@@ -101,7 +101,16 @@ test('createInitialContext creates empty direct context', () => {
 
 test('createInitialContext creates empty sentinel context', () => {
     var context = createInitialContext('redis+sentinel://s1.local:26379?sentinelMasterId=mymaster')
+    assert.equal(context.mode, 'sentinel')
+    assert.equal(context.masterName, 'mymaster')
+    assert.equal(context.sentinel, undefined)
+    assert.equal(context.sentinelSubscriber, undefined)
+    assert.deepEqual(context.replicas, [])
+    assert.deepEqual(context.timers, {})
+})
 
+test('createInitialContext from env REDIS_URL', ()=>{
+    var context = createInitialContext(process.env.REDIS_URL);
     assert.equal(context.mode, 'sentinel')
     assert.equal(context.masterName, 'mymaster')
     assert.equal(context.sentinel, undefined)
