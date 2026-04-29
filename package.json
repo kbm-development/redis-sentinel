@@ -1,11 +1,11 @@
 {
   "name": "redis-sentinel",
   "version": "0.1.0",
-  "description": "Small Node.js Redis Sentinel wrapper with topology discovery, read/write routing, and background failover reconciliation.",
+  "description": "Small Node.js Redis Sentinel wrapper installable from GitHub with topology discovery, read/write routing, and background failover reconciliation.",
   "main": "index.js",
-  "private": true,
+  "private": false,
   "author": "azizzaeny",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+ssh://git@github.com/kbm-development/redis-sentinel.git"
