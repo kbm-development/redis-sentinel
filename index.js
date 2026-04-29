@@ -4,6 +4,77 @@ var redis = require('redis')
 
 var SENTINEL_PROTOCOL = 'redis+sentinel://'
 
+var READ_COMMANDS = new Set([
+    'GET', 'MGET', 'GETRANGE', 'STRLEN',
+    'EXISTS', 'TTL', 'PTTL',
+    'KEYS', 'SCAN',
+    'LRANGE', 'LINDEX', 'LLEN',
+    'SMEMBERS', 'SCARD', 'SISMEMBER',
+    'ZRANGE', 'ZREVRANGE',
+    'ZSCORE', 'ZCARD',
+    'ZRANK', 'ZREVRANK',
+    'HGET', 'HGETALL', 'HKEYS',
+    'HVALS', 'HLEN', 'HEXISTS',
+    'XRANGE', 'XREVRANGE',
+    'XREAD', 'XINFO',
+    'JSON.GET', 'JSON.MGET',
+    'FT.SEARCH', 'FT.AGGREGATE',
+    'GRAPH.RO_QUERY',
+    'TS.GET', 'TS.MGET', 'TS.RANGE', 'TS.MRANGE'
+])
+
+var WRITE_COMMANDS = new Set([
+    'SET', 'SETNX', 'SETEX', 'PSETEX', 'APPEND',
+    'INCR', 'DECR', 'INCRBY', 'DECRBY', 'INCRBYFLOAT',
+    'MSET', 'MSETNX', 'SETBIT', 'SETRANGE',
+    'DEL', 'UNLINK', 'EXPIRE', 'EXPIREAT', 'PEXPIRE', 'PEXPIREAT',
+    'PERSIST', 'RENAME', 'RENAMENX', 'MOVE', 'COPY',
+    'RESTORE', 'MIGRATE',
+    'RPUSH', 'LPUSH', 'RPUSHX', 'LPUSHX',
+    'LINSERT', 'LSET', 'LTRIM',
+    'RPOP', 'LPOP', 'RPOPLPUSH',
+    'LMOVE', 'BLMOVE', 'LREM',
+    'SADD', 'SREM', 'SMOVE', 'SPOP',
+    'SINTERSTORE', 'SUNIONSTORE', 'SDIFFSTORE',
+    'ZADD', 'ZINCRBY', 'ZREM',
+    'ZREMRANGEBYRANK',
+    'ZREMRANGEBYSCORE',
+    'ZREMRANGEBYLEX',
+    'ZUNIONSTORE',
+    'ZINTERSTORE',
+    'BZPOPMIN', 'BZPOPMAX',
+    'ZPOPMIN', 'ZPOPMAX',
+    'HSET', 'HSETNX', 'HMSET',
+    'HINCRBY', 'HINCRBYFLOAT', 'HDEL',
+    'XADD', 'XDEL', 'XTRIM',
+    'XGROUP', 'XSETID',
+    'XACK', 'XAUTOCLAIM', 'XCLAIM',
+    'PUBLISH',
+    'MULTI', 'EXEC', 'DISCARD', 'WATCH', 'UNWATCH',
+    'JSON.SET', 'JSON.MSET', 'JSON.DEL',
+    'JSON.NUMINCRBY', 'JSON.NUMMULTBY',
+    'JSON.STRAPPEND',
+    'JSON.ARRAPPEND',
+    'JSON.ARRINSERT',
+    'JSON.ARRPOP',
+    'JSON.ARRTRIM',
+    'JSON.CLEAR',
+    'FT.CREATE', 'FT.ALTER',
+    'FT.DROPINDEX',
+    'FT.ALIASADD', 'FT.ALIASDEL',
+    'FT.SUGADD', 'FT.SUGDEL',
+    'GRAPH.DELETE', 'GRAPH.QUERY',
+    'TS.CREATE', 'TS.ALTER',
+    'TS.ADD', 'TS.MADD',
+    'TS.INCRBY', 'TS.DECRBY',
+    'TS.CREATERULE', 'TS.DELETERULE',
+    'EVAL', 'EVALSHA',
+    'FUNCTION', 'SCRIPT',
+    'FLUSHALL', 'FLUSHDB',
+    'CONFIG', 'MODULE',
+    'ACL', 'CLIENT'
+])
+
 var assertString = (value, name) => {
     if (typeof value !== 'string' || value.trim() === '') {
         throw new Error(`${name} must be a non-empty string`)
@@ -373,17 +444,57 @@ var getDirectClient = (context) => {
     return context.master.client
 }
 
+var getMasterClient = (context) => {
+    if (!context.master || !context.master.client) {
+        throw new Error('master redis connection is not available')
+    }
+
+    return context.master.client
+}
+
+var classifyCommand = (args) => {
+    if (!Array.isArray(args) || args.length === 0) {
+        throw new Error('command args must be a non-empty array')
+    }
+
+    var name = String(args[0]).toUpperCase()
+
+    if (READ_COMMANDS.has(name)) return 'read'
+    if (WRITE_COMMANDS.has(name)) return 'write'
+    return 'write'
+}
+
+var isHealthyConnection = (connection) => {
+    return Boolean(connection && connection.status === 'up' && connection.client)
+}
+
+var chooseReplica = (context) => {
+    return (context.replicas || []).find(isHealthyConnection)
+}
+
+var getCommandClient = (args, context) => {
+    if (context.mode === 'direct') return getDirectClient(context)
+
+    if (context.mode !== 'sentinel') {
+        throw new Error('unknown redis context mode')
+    }
+
+    var type = classifyCommand(args)
+    if (type === 'read') {
+        var replica = chooseReplica(context)
+        if (replica) return replica.client
+    }
+
+    return getMasterClient(context)
+}
+
 var command = async (args, context) => {
     if (!Array.isArray(args) || args.length === 0) {
         throw new Error('command args must be a non-empty array')
     }
 
-    if (context.mode === 'direct') {
-        var client = getDirectClient(context)
-        return client.sendCommand(args)
-    }
-
-    throw new Error('sentinel command routing is not implemented yet')
+    var client = getCommandClient(args, context)
+    return client.sendCommand(args)
 }
 
 var closeClient = async (client) => {
@@ -427,6 +538,12 @@ module.exports = {
     discoverReplicas,
     discoverTopology,
     connectTopology,
+    READ_COMMANDS,
+    WRITE_COMMANDS,
+    classifyCommand,
+    isHealthyConnection,
+    chooseReplica,
+    getCommandClient,
     command,
     closeRedisContext
 }

@@ -17,6 +17,8 @@ var {
     createRedisNodeClientOptions,
     connectRedisNode,
     connectTopology,
+    classifyCommand,
+    chooseReplica,
     command,
     closeRedisContext
 } = require('./index')
@@ -575,6 +577,153 @@ test('connectTopology requires discovered topology', async () => {
     await assert.rejects(() => connectTopology(context, () => ({})), /discovered topology/)
 })
 
+test('classifyCommand classifies reads, writes, and unknown commands', () => {
+    assert.equal(classifyCommand(['GET', 'key']), 'read')
+    assert.equal(classifyCommand(['get', 'key']), 'read')
+    assert.equal(classifyCommand(['HGETALL', 'hash']), 'read')
+    assert.equal(classifyCommand(['XINFO', 'STREAM', 'stream']), 'read')
+    assert.equal(classifyCommand(['JSON.GET', 'doc']), 'read')
+    assert.equal(classifyCommand(['FT.SEARCH', 'idx', '*']), 'read')
+    assert.equal(classifyCommand(['TS.RANGE', 'series', '-', '+']), 'read')
+    assert.equal(classifyCommand(['SET', 'key', 'value']), 'write')
+    assert.equal(classifyCommand(['EXPIREAT', 'key', '1']), 'write')
+    assert.equal(classifyCommand(['ZREMRANGEBYSCORE', 'zset', '0', '1']), 'write')
+    assert.equal(classifyCommand(['XGROUP', 'CREATE', 'stream', 'group', '$']), 'write')
+    assert.equal(classifyCommand(['JSON.ARRAPPEND', 'doc', '$', '1']), 'write')
+    assert.equal(classifyCommand(['FT.CREATE', 'idx', 'SCHEMA', 'name', 'TEXT']), 'write')
+    assert.equal(classifyCommand(['TS.ADD', 'series', '*', '1']), 'write')
+    assert.equal(classifyCommand(['EVALSHA', 'sha', '0']), 'write')
+    assert.equal(classifyCommand(['FLUSHDB']), 'write')
+    assert.equal(classifyCommand(['SOMETHING-CUSTOM', 'key']), 'write')
+})
+
+test('chooseReplica returns first healthy replica', () => {
+    var first = { status: 'down', client: {} }
+    var second = { status: 'up', client: { name: 'second' } }
+    var third = { status: 'up', client: { name: 'third' } }
+    var context = Object.freeze({ replicas: Object.freeze([first, second, third]) })
+
+    assert.equal(chooseReplica(context), second)
+})
+
+test('sentinel command routes writes to master', async () => {
+    var calls = []
+    var masterClient = {
+        sendCommand: async (args) => {
+            calls.push(['master', args])
+            return 'ok'
+        }
+    }
+    var replicaClient = {
+        sendCommand: async (args) => {
+            calls.push(['replica', args])
+            return 'replica'
+        }
+    }
+    var context = Object.freeze({
+        mode: 'sentinel',
+        master: { status: 'up', client: masterClient },
+        replicas: Object.freeze([{ status: 'up', client: replicaClient }])
+    })
+    var result = await command(['SET', 'key', 'value'], context)
+
+    assert.equal(result, 'ok')
+    assert.deepEqual(calls, [['master', ['SET', 'key', 'value']]])
+})
+
+test('sentinel command routes reads to healthy replica', async () => {
+    var calls = []
+    var masterClient = {
+        sendCommand: async (args) => {
+            calls.push(['master', args])
+            return 'master'
+        }
+    }
+    var replicaClient = {
+        sendCommand: async (args) => {
+            calls.push(['replica', args])
+            return 'value'
+        }
+    }
+    var context = Object.freeze({
+        mode: 'sentinel',
+        master: { status: 'up', client: masterClient },
+        replicas: Object.freeze([{ status: 'up', client: replicaClient }])
+    })
+    var result = await command(['GET', 'key'], context)
+
+    assert.equal(result, 'value')
+    assert.deepEqual(calls, [['replica', ['GET', 'key']]])
+})
+
+test('sentinel command falls back reads to master when no healthy replica', async () => {
+    var calls = []
+    var masterClient = {
+        sendCommand: async (args) => {
+            calls.push(['master', args])
+            return 'value'
+        }
+    }
+    var downReplicaClient = {
+        sendCommand: async (args) => {
+            calls.push(['replica', args])
+            return 'replica'
+        }
+    }
+    var context = Object.freeze({
+        mode: 'sentinel',
+        master: { status: 'up', client: masterClient },
+        replicas: Object.freeze([{ status: 'down', client: downReplicaClient }])
+    })
+    var result = await command(['GET', 'key'], context)
+
+    assert.equal(result, 'value')
+    assert.deepEqual(calls, [['master', ['GET', 'key']]])
+})
+
+test('sentinel command routes unknown commands to master', async () => {
+    var calls = []
+    var masterClient = {
+        sendCommand: async (args) => {
+            calls.push(['master', args])
+            return 'ok'
+        }
+    }
+    var replicaClient = {
+        sendCommand: async (args) => {
+            calls.push(['replica', args])
+            return 'replica'
+        }
+    }
+    var context = Object.freeze({
+        mode: 'sentinel',
+        master: { status: 'up', client: masterClient },
+        replicas: Object.freeze([{ status: 'up', client: replicaClient }])
+    })
+    var result = await command(['CUSTOM.WRITE', 'key'], context)
+
+    assert.equal(result, 'ok')
+    assert.deepEqual(calls, [['master', ['CUSTOM.WRITE', 'key']]])
+})
+
+test('sentinel command surfaces errors without retry', async () => {
+    var attempts = 0
+    var masterClient = {
+        sendCommand: async () => {
+            attempts += 1
+            throw new Error('write failed')
+        }
+    }
+    var context = Object.freeze({
+        mode: 'sentinel',
+        master: { status: 'up', client: masterClient },
+        replicas: Object.freeze([])
+    })
+
+    await assert.rejects(() => command(['SET', 'key', 'value'], context), /write failed/)
+    assert.equal(attempts, 1)
+})
+
 test('test real context data from direction connections', async () =>{
     if (!process.env.REDIS_URL) return;
     var context = createInitialContext(process.env.REDIS_URL);
@@ -632,6 +781,23 @@ test('test real sentinel data node connections', async ()=>{
 			assert.equal(context.master.role, 'master');
 			assert.equal(context.master.status, 'up');
 			assert.equal(Array.isArray(context.replicas), true);
+		} finally {
+			await closeRedisContext(context);
+		}
+	}
+});
+
+test('test real sentinel command routing', async ()=>{
+	if (!process.env.REDIS_URL) return;
+    var context = createInitialContext(process.env.REDIS_URL);
+	if(context.mode === 'sentinel'){
+		try {
+			context = await connectSentinel(context);
+			context = await discoverTopology(context);
+			context = await connectTopology(context);
+			await command(['SET', 'phase6-key', 'phase6-value'], context);
+			var result = await command(['GET', 'phase6-key'], context);
+			assert.notEqual(result, null);
 		} finally {
 			await closeRedisContext(context);
 		}
