@@ -1,4 +1,6 @@
-## Problem
+## Smart Redis Connection
+
+### Problem
 
 we are currently at the stage of needed redis library thats smart enough to handle connections changes, after looking at library out there, non of statisfied our need, usual redis sentinel is always connect to master which is we wanted to balancing load from slave as well, so we need smart routing the commands what goes to master what goes to slave, we also need to make no down time when master is down, by sentinel default it would promote in the background new master, and our clients library will re-establish it topology reconnect without glitch in the client, so we need to reconnect, if master,slave, or sentinel dies, it known and smart enough to handle the changes
 
@@ -57,14 +59,11 @@ The context should eventually contain:
 - `timers`: background reconciliation / health timers
 - `options`: intervals, thresholds, backoff config
 
-Each Redis node connection record should eventually contain:
+### Usage
 
-- `key`: stable `host:port` key
-- `role`: `master` or `replica`
-- `host`
-- `port`
-- `client`
-- `status`: `up`, `suspect`, `down`, `connecting`, or `closed`
-- `failures`
-- `retry`: per-connection retry state
-
+```js 
+var redis = await createRedis(process.env.REDIS_URL);
+await command(['SET', 'key', 'value'], redis);
+var value = await command(['GET', 'key'], redis);
+await closeRedis(redis);
+```
