@@ -218,11 +218,12 @@ test('test real context data from direction connections', async () =>{
 		assert.equal(context.mode, 'direct');
 		context = await connectDirect(context);
 		assert.equal(context.master.role, 'master');
+		await command(['SET', 'foo', 'bar'], context);
 		let results = await command(['GET', 'foo'], context);
-		assert.notEqual(results, null)
+		assert.notEqual(results, null);
 		await closeRedisContext(context);
 	}
-	assert.equal(1,1) // just pass
+	assert.equal(1, 1) // just pass
 });
 
 var run = async () => {
