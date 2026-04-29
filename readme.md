@@ -1,41 +1,72 @@
-## Smart Redis Connection
+# Smart Redis Connection
 
-### Problem
+## Problem
 
-we are currently at the stage of needed redis library thats smart enough to handle connections changes, after looking at library out there, non of statisfied our need, usual redis sentinel is always connect to master which is we wanted to balancing load from slave as well, so we need smart routing the commands what goes to master what goes to slave, we also need to make no down time when master is down, by sentinel default it would promote in the background new master, and our clients library will re-establish it topology reconnect without glitch in the client, so we need to reconnect, if master,slave, or sentinel dies, it known and smart enough to handle the changes
+Redis Sentinel solves master discovery and failover, but most Node.js clients still treat Sentinel mainly as a way to find the current master. That is not enough for this use case.
 
+We need a Redis client wrapper that understands the full Sentinel topology:
 
-We want to build a small Node.js Redis client wrapper that supports Redis Sentinel discovery, read/write routing, topology changes, failover recovery, and low-disruption connection management.
+- Writes must go to the current master.
+- Reads should use healthy replicas when available.
+- Reads should fall back to master if replicas are unavailable.
+- Master failover should be detected and reconciled automatically.
+- Sentinel outages should not stop existing Redis traffic.
+- Redis node failures should be handled independently per connection.
+- Foreground commands should not be retried automatically, to avoid accidental double writes.
 
-Create a Redis Sentinel aware library using `node-redis` with these behaviors:
+The goal is to keep Redis access stable during topology changes while avoiding reconnect storms, unnecessary full reconnects, and expensive repeated discovery calls.
 
-- Support normal `redis://` direct mode.
-- Support `redis+sentinel://` discovery mode.
+This library is a small wrapper around `node-redis`. Sentinel is used as the discovery and control plane. Master and replica Redis connections are the data plane.
+
+## Goals
+
+- Support `redis://` direct mode.
+- Support `redis+sentinel://` Sentinel mode.
 - Discover master and replicas from Sentinel.
 - Route writes to master.
-- Route reads to replicas when available.
-- Fall back reads to master when no healthy replica exists.
-- Detect Sentinel/topology changes without reconnect storms.
-- Handle master, replica, and Sentinel failures independently.
-- Avoid automatic command retry that could cause accidental double writes.
-- Keep implementation functional, small, and dependency-light.
+- Route reads to healthy replicas.
+- Fall back reads to master when replicas are unavailable.
+- Reconcile topology changes in the background.
+- Listen to Sentinel topology events and debounce reconciliation.
+- Heal Sentinel command connections in the background.
+- Handle Sentinel, master, and replica failures independently.
+- Avoid automatic foreground command retries.
 
+## Non-Goals
 
-## Connection String Shape
+- No Redis Cluster support.
+- No automatic write retries.
+- No dependency-heavy abstraction.
+- No hidden `client.get()` / `client.set()` API wrapping.
 
-Direct Redis mode:
+## Usage
+
+```js
+var { createRedis, command, closeRedis } = require('./index')
+
+var redis = await createRedis(process.env.REDIS_URL)
+
+await command(['SET', 'key', 'value'], redis)
+var value = await command(['GET', 'key'], redis)
+
+await closeRedis(redis)
+```
+
+## Connection Strings
+
+### Direct Redis
 
 ```text
 redis://host:port
 ```
 
-Sentinel mode:
+### Redis Sentinel
 
 ```text
 redis+sentinel://host1:26379,host2:26379,host3:26379?sentinelMasterId=mymaster
 ```
 
-Optional auth form:
+### Redis Sentinel With Auth
 
 ```text
 redis+sentinel://username:password@host1:26379,host2:26379?sentinelMasterId=mymaster
@@ -43,27 +74,18 @@ redis+sentinel://username:password@host1:26379,host2:26379?sentinelMasterId=myma
 
 The Sentinel URI points to Sentinel nodes, not Redis master or replica nodes.
 
-## Target State Shape
+## Behavior
 
-The context should eventually contain:
+- Sentinel discovers the current master and replicas.
+- Writes go to the current master.
+- Reads go to a healthy replica when available.
+- Reads fall back to master if no healthy replica exists.
+- Unknown commands are treated as writes and sent to master.
+- Background reconciliation keeps topology fresh.
+- Sentinel pub/sub events trigger debounced reconciliation.
+- Sentinel failures do not kill active master/replica connections.
+- Failed foreground commands are returned to the caller without automatic retry.
 
-- `mode`: `direct` or `sentinel`
-- `sentinels`: configured Sentinel candidates
-- `sentinel`: currently active Sentinel command connection
-- `sentinelSubscriber`: active Sentinel event subscription connection
-- `masterName`: Sentinel master name
-- `username` / `password`: Redis auth options
-- `master`: current master connection record
-- `replicas`: current replica connection records
-- `topology`: last known topology snapshot
-- `timers`: background reconciliation / health timers
-- `options`: intervals, thresholds, backoff config
+## Deployment Note
 
-### Usage
-
-```js 
-var redis = await createRedis(process.env.REDIS_URL);
-await command(['SET', 'key', 'value'], redis);
-var value = await command(['GET', 'key'], redis);
-await closeRedis(redis);
-```
+Redis replicas may need `replica-announce-ip` configured so Sentinel returns addresses reachable by the Node.js application.
