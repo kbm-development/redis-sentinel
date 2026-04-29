@@ -144,6 +144,45 @@ var connectDirect = async (context, createClient = createRedisClient) => {
     })
 }
 
+var createSentinelClientOptions = (sentinel, context) => {
+    return {
+        socket: {
+            host: sentinel.host,
+            port: sentinel.port
+        },
+        username: context.username,
+        password: context.password
+    }
+}
+
+var connectSentinel = async (context, createClient = createRedisClient) => {
+    if (!context || context.mode !== 'sentinel') {
+        throw new Error('connectSentinel requires a sentinel redis context')
+    }
+
+    var lastError = undefined
+
+    for (var sentinel of context.sentinels) {
+        var client = createClient(createSentinelClientOptions(sentinel, context))
+
+        try {
+            await client.connect()
+
+            return Object.freeze({
+                ...context,
+                sentinel: client
+            })
+        } catch (err) {
+            lastError = err
+            await closeClient(client)
+        }
+    }
+
+    var error = new Error('Cannot connect sentinel, no sentinel available')
+    error.cause = lastError
+    throw error
+}
+
 var getDirectClient = (context) => {
     if (!context || context.mode !== 'direct') {
         throw new Error('direct command requires a direct redis context')
@@ -171,8 +210,10 @@ var command = async (args, context) => {
 
 var closeClient = async (client) => {
     if (!client) return
-    if (typeof client.quit === 'function') return client.quit()
+    if (typeof client.close === 'function') return client.close()
+    if (typeof client.destroy === 'function') return client.destroy()
     if (typeof client.disconnect === 'function') return client.disconnect()
+    if (typeof client.quit === 'function') return client.quit()
 }
 
 var closeRedisContext = async (context) => {
@@ -196,6 +237,8 @@ module.exports = {
     createRedisClient,
     createConnectionRecord,
     connectDirect,
+    createSentinelClientOptions,
+    connectSentinel,
     command,
     closeRedisContext
 }

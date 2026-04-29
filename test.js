@@ -7,6 +7,8 @@ var {
     parseSentinelNode,
     parsePort,
     connectDirect,
+    createSentinelClientOptions,
+    connectSentinel,
     command,
     closeRedisContext
 } = require('./index')
@@ -211,6 +213,112 @@ test('closeRedisContext closes direct master client', async () => {
     assert.deepEqual(calls, ['quit'])
 });
 
+test('closeRedisContext prefers socket close over quit command', async () => {
+    var calls = []
+    var fakeClient = {
+        connect: async () => undefined,
+        sendCommand: async () => 'ok',
+        close: async () => calls.push('close'),
+        quit: async () => calls.push('quit')
+    }
+    var context = createInitialContext('redis://redis.local:6379')
+    var connected = await connectDirect(context, () => fakeClient)
+
+    await closeRedisContext(connected)
+
+    assert.deepEqual(calls, ['close'])
+});
+
+test('createSentinelClientOptions creates node redis sentinel socket options', () => {
+    var context = createInitialContext('redis+sentinel://user:pass@s1.local:26379?sentinelMasterId=mymaster')
+    var options = createSentinelClientOptions(context.sentinels[0], context)
+
+    assert.deepEqual(options, {
+        socket: {
+            host: 's1.local',
+            port: 26379
+        },
+        username: 'user',
+        password: 'pass'
+    })
+})
+
+test('connectSentinel connects first available sentinel', async () => {
+    var createdOptions = []
+    var calls = []
+    var fakeClient = {
+        connect: async () => calls.push('connect'),
+        quit: async () => calls.push('quit')
+    }
+    var createClient = (options) => {
+        createdOptions.push(options)
+        return fakeClient
+    }
+    var context = createInitialContext('redis+sentinel://s1.local:26379,s2.local:26380?sentinelMasterId=mymaster')
+    var connected = await connectSentinel(context, createClient)
+
+    assert.equal(connected.sentinel, fakeClient)
+    assert.equal(connected.sentinels.length, 2)
+    assert.deepEqual(calls, ['connect'])
+    assert.deepEqual(createdOptions, [{
+        socket: {
+            host: 's1.local',
+            port: 26379
+        },
+        username: undefined,
+        password: undefined
+    }])
+})
+
+test('connectSentinel tries next sentinel when one fails', async () => {
+    var calls = []
+    var firstClient = {
+        connect: async () => {
+            calls.push('connect first')
+            throw new Error('first failed')
+        },
+        quit: async () => calls.push('quit first')
+    }
+    var secondClient = {
+        connect: async () => calls.push('connect second'),
+        quit: async () => calls.push('quit second')
+    }
+    var clients = [firstClient, secondClient]
+    var createClient = () => clients.shift()
+    var context = createInitialContext('redis+sentinel://s1.local:26379,s2.local:26380?sentinelMasterId=mymaster')
+    var connected = await connectSentinel(context, createClient)
+
+    assert.equal(connected.sentinel, secondClient)
+    assert.deepEqual(calls, ['connect first', 'quit first', 'connect second'])
+})
+
+test('connectSentinel rejects when all sentinels fail', async () => {
+    var calls = []
+    var createClient = () => ({
+        connect: async () => {
+            calls.push('connect')
+            throw new Error('failed')
+        },
+        quit: async () => calls.push('quit')
+    })
+    var context = createInitialContext('redis+sentinel://s1.local:26379,s2.local:26380?sentinelMasterId=mymaster')
+
+    await assert.rejects(
+        () => connectSentinel(context, createClient),
+        /no sentinel available/
+    )
+    assert.deepEqual(calls, ['connect', 'quit', 'connect', 'quit'])
+})
+
+test('connectSentinel rejects direct context', async () => {
+    var context = createInitialContext('redis://redis.local:6379')
+
+    await assert.rejects(
+        () => connectSentinel(context, () => ({})),
+        /sentinel redis context/
+    )
+})
+
 test('test real context data from direction connections', async () =>{
     if (!process.env.REDIS_URL) return;
     var context = createInitialContext(process.env.REDIS_URL);
@@ -224,6 +332,21 @@ test('test real context data from direction connections', async () =>{
 		await closeRedisContext(context);
 	}
 	assert.equal(1, 1) // just pass
+});
+
+test('test real sentinel connections', async ()=>{
+	if (!process.env.REDIS_URL) return;
+    var context = createInitialContext(process.env.REDIS_URL);
+	if(context.mode === 'sentinel'){
+		try {
+			assert.equal(context.mode, 'sentinel');
+			assert.notEqual(context.sentinels.length, 0);
+			context = await connectSentinel(context);
+			assert.notEqual(context.sentinel, null);
+		} finally {
+			await closeRedisContext(context);
+		}
+	}
 });
 
 var run = async () => {
