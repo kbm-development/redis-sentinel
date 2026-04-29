@@ -382,7 +382,8 @@ var connectSentinel = async (context, createClient = createRedisClient) => {
 
     var lastError = undefined
 
-    for (var sentinel of context.sentinels) {
+    for (var i = 0; i < context.sentinels.length; i += 1) {
+        var sentinel = context.sentinels[i]
         var client = createClient(createSentinelClientOptions(sentinel, context))
 
         try {
@@ -390,7 +391,9 @@ var connectSentinel = async (context, createClient = createRedisClient) => {
 
             return Object.freeze({
                 ...context,
-                sentinel: client
+                sentinel: client,
+                sentinelIndex: i,
+                sentinelHealth: createClientHealthRecord('sentinel', client)
             })
         } catch (err) {
             lastError = err
@@ -401,6 +404,137 @@ var connectSentinel = async (context, createClient = createRedisClient) => {
     var error = new Error('Cannot connect sentinel, no sentinel available')
     error.cause = lastError
     throw error
+}
+
+var createSentinelKey = (sentinel) => createNodeKey(sentinel.host, sentinel.port)
+
+var getSentinelHealthMap = (context) => context.sentinelCandidateHealth || Object.freeze({})
+
+var getSentinelCandidateHealth = (context, sentinel) => {
+    var key = createSentinelKey(sentinel)
+    return getSentinelHealthMap(context)[key] || createConnectionRecord('sentinelCandidate', key, undefined, sentinel)
+}
+
+var setSentinelCandidateHealth = (context, sentinel, record) => {
+    var key = createSentinelKey(sentinel)
+
+    return Object.freeze({
+        ...context,
+        sentinelCandidateHealth: Object.freeze({
+            ...getSentinelHealthMap(context),
+            [key]: record
+        })
+    })
+}
+
+var markSentinelCandidateFailure = (context, sentinel, options = {}) => {
+    var health = getSentinelCandidateHealth(context, sentinel)
+    return setSentinelCandidateHealth(context, sentinel, markConnectionFailure(health, options))
+}
+
+var markSentinelCandidateSuccess = (context, sentinel, client) => {
+    var key = createSentinelKey(sentinel)
+    var health = createConnectionRecord('sentinelCandidate', key, client, sentinel)
+    return setSentinelCandidateHealth(context, sentinel, health)
+}
+
+var getNextSentinelIndexes = (context) => {
+    var total = context.sentinels.length
+    var start = ((context.sentinelIndex || 0) + 1) % total
+    var indexes = []
+
+    for (var offset = 0; offset < total; offset += 1) {
+        indexes.push((start + offset) % total)
+    }
+
+    return indexes
+}
+
+var canTrySentinelCandidate = (context, sentinel, now = Date.now()) => {
+    return canRetryNow(getSentinelCandidateHealth(context, sentinel), now)
+}
+
+var connectSentinelCandidate = async (context, sentinel, createClient = createRedisClient) => {
+    var client = createClient(createSentinelClientOptions(sentinel, context))
+
+    try {
+        await client.connect()
+        return client
+    } catch (err) {
+        await closeClient(client)
+        throw err
+    }
+}
+
+var healSentinelOnce = async (context, options = {}) => {
+    if (!context || context.mode !== 'sentinel') {
+        throw new Error('healSentinelOnce requires a sentinel redis context')
+    }
+
+    var createClient = options.createClient || createRedisClient
+    var dataCreateClient = options.dataCreateClient || createRedisClient
+    var healthOptions = getHealthOptions(options)
+    var indexes = getNextSentinelIndexes(context)
+    var nextContext = context
+
+    for (var index of indexes) {
+        var sentinel = context.sentinels[index]
+        if (!canTrySentinelCandidate(nextContext, sentinel, healthOptions.now)) continue
+
+        try {
+            var client = await connectSentinelCandidate(nextContext, sentinel, createClient)
+            var oldSentinel = nextContext.sentinel
+            nextContext = markSentinelCandidateSuccess(nextContext, sentinel, client)
+            nextContext = Object.freeze({
+                ...nextContext,
+                sentinel: client,
+                sentinelIndex: index,
+                sentinelHealth: createClientHealthRecord('sentinel', client),
+                sentinelStatus: 'up'
+            })
+
+            if (oldSentinel && oldSentinel !== client) await closeClient(oldSentinel)
+
+            return reconcileTopology(nextContext, dataCreateClient)
+        } catch (err) {
+            nextContext = markSentinelCandidateFailure(nextContext, sentinel, healthOptions)
+        }
+    }
+
+    return markSentinelSuspect(nextContext, new Error('Cannot heal sentinel, no sentinel available'))
+}
+
+var getSentinelHealInterval = (context, options = {}) => {
+    return options.intervalMs || context.options.sentinelHealIntervalMs || 1000
+}
+
+var createSentinelHealer = (context, options = {}) => {
+    var current = context
+    var running = false
+    var scheduler = options.scheduler || createScheduler()
+    var intervalMs = getSentinelHealInterval(context, options)
+    var heal = async () => {
+        if (running) return current
+
+        running = true
+        try {
+            current = await healSentinelOnce(current, options)
+            return current
+        } finally {
+            running = false
+        }
+    }
+    var timer = scheduler.setInterval(() => {
+        heal().catch(() => undefined)
+    }, intervalMs)
+
+    return Object.freeze({
+        getContext: () => current,
+        heal,
+        stop: () => scheduler.clearInterval(timer),
+        timer,
+        intervalMs
+    })
 }
 
 var createNodeKey = (host, port) => `${host}:${port}`
@@ -886,6 +1020,18 @@ module.exports = {
     connectDirect,
     createSentinelClientOptions,
     connectSentinel,
+    createSentinelKey,
+    getSentinelHealthMap,
+    getSentinelCandidateHealth,
+    setSentinelCandidateHealth,
+    markSentinelCandidateFailure,
+    markSentinelCandidateSuccess,
+    getNextSentinelIndexes,
+    canTrySentinelCandidate,
+    connectSentinelCandidate,
+    healSentinelOnce,
+    getSentinelHealInterval,
+    createSentinelHealer,
     createNodeKey,
     normalizeMaster,
     normalizeReplicas,

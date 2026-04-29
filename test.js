@@ -35,6 +35,12 @@ var {
     subscribeSentinelChannels,
     createDebouncedReconcile,
     createSentinelEventSubscription,
+    getSentinelCandidateHealth,
+    getNextSentinelIndexes,
+    canTrySentinelCandidate,
+    healSentinelOnce,
+    getSentinelHealInterval,
+    createSentinelHealer,
     classifyCommand,
     chooseReplica,
     command,
@@ -504,6 +510,206 @@ test('connectSentinel rejects direct context', async () => {
         () => connectSentinel(context, () => ({})),
         /sentinel redis context/
     )
+})
+
+test('getNextSentinelIndexes starts after current sentinel', () => {
+    var context = Object.freeze({
+        sentinelIndex: 1,
+        sentinels: Object.freeze([
+            { host: 's1.local', port: 26379 },
+            { host: 's2.local', port: 26379 },
+            { host: 's3.local', port: 26379 }
+        ])
+    })
+
+    assert.deepEqual(getNextSentinelIndexes(context), [2, 0, 1])
+})
+
+test('canTrySentinelCandidate respects per candidate retry state', () => {
+    var sentinel = { host: 's1.local', port: 26379 }
+    var context = Object.freeze({
+        sentinelCandidateHealth: Object.freeze({
+            's1.local:26379': Object.freeze({
+                key: 's1.local:26379',
+                retry: Object.freeze({ next: 2000 })
+            })
+        })
+    })
+
+    assert.equal(canTrySentinelCandidate(context, sentinel, 1000), false)
+    assert.equal(canTrySentinelCandidate(context, sentinel, 2000), true)
+})
+
+test('healSentinelOnce reconnects next sentinel and reconciles topology', async () => {
+    var calls = []
+    var oldSentinelClient = { close: async () => calls.push('close old sentinel') }
+    var newSentinelClient = {
+        connect: async () => calls.push('connect s2'),
+        close: async () => calls.push('close s2'),
+        sendCommand: async (args) => {
+            calls.push(args[1])
+            if (args[1] === 'get-master-addr-by-name') return ['master', '6379']
+            return [['ip', 'replica-a', 'port', '6379', 'flags', 'slave']]
+        }
+    }
+    var context = Object.freeze({
+        mode: 'sentinel',
+        masterName: 'mymaster',
+        options: Object.freeze({}),
+        sentinelIndex: 0,
+        sentinels: Object.freeze([
+            { host: 's1.local', port: 26379 },
+            { host: 's2.local', port: 26379 }
+        ]),
+        sentinel: oldSentinelClient,
+        master: { key: 'master:6379', client: {}, status: 'up' },
+        replicas: Object.freeze([{ key: 'replica-a:6379', client: {}, status: 'up' }])
+    })
+    var result = await healSentinelOnce(context, {
+        now: 1000,
+        createClient: () => newSentinelClient,
+        dataCreateClient: () => {
+            throw new Error('should not connect data plane')
+        }
+    })
+
+    assert.deepEqual(calls, ['connect s2', 'close old sentinel', 'get-master-addr-by-name', 'replicas'])
+    assert.equal(result.sentinel, newSentinelClient)
+    assert.equal(result.sentinelIndex, 1)
+    assert.equal(result.master, context.master)
+    assert.equal(result.replicas, context.replicas)
+    assert.equal(getSentinelCandidateHealth(result, { host: 's2.local', port: 26379 }).status, 'up')
+})
+
+test('healSentinelOnce skips candidates still in backoff', async () => {
+    var calls = []
+    var s1Client = {
+        connect: async () => calls.push('connect s1'),
+        sendCommand: async (args) => {
+            if (args[1] === 'get-master-addr-by-name') return ['master', '6379']
+            return []
+        }
+    }
+    var context = Object.freeze({
+        mode: 'sentinel',
+        masterName: 'mymaster',
+        options: Object.freeze({}),
+        sentinelIndex: 0,
+        sentinels: Object.freeze([
+            { host: 's1.local', port: 26379 },
+            { host: 's2.local', port: 26379 }
+        ]),
+        sentinelCandidateHealth: Object.freeze({
+            's2.local:26379': Object.freeze({
+                key: 's2.local:26379',
+                retry: Object.freeze({ next: 5000 })
+            })
+        }),
+        master: { key: 'master:6379', client: {}, status: 'up' },
+        replicas: Object.freeze([])
+    })
+    var result = await healSentinelOnce(context, {
+        now: 1000,
+        createClient: () => s1Client,
+        dataCreateClient: () => {
+            throw new Error('should not connect data plane')
+        }
+    })
+
+    assert.deepEqual(calls, ['connect s1'])
+    assert.equal(result.sentinelIndex, 0)
+})
+
+test('healSentinelOnce keeps data plane alive when all sentinels fail', async () => {
+    var calls = []
+    var masterClient = { close: async () => calls.push('close master') }
+    var replicaClient = { close: async () => calls.push('close replica') }
+    var createClient = () => ({
+        connect: async () => {
+            calls.push('connect sentinel')
+            throw new Error('sentinel failed')
+        },
+        close: async () => calls.push('close failed sentinel')
+    })
+    var context = Object.freeze({
+        mode: 'sentinel',
+        options: Object.freeze({}),
+        sentinelIndex: 0,
+        sentinels: Object.freeze([
+            { host: 's1.local', port: 26379 },
+            { host: 's2.local', port: 26379 }
+        ]),
+        master: { key: 'master:6379', client: masterClient, status: 'up' },
+        replicas: Object.freeze([{ key: 'replica-a:6379', client: replicaClient, status: 'up' }])
+    })
+    var result = await healSentinelOnce(context, {
+        failureThreshold: 1,
+        now: 1000,
+        createClient
+    })
+
+    assert.deepEqual(calls, ['connect sentinel', 'close failed sentinel', 'connect sentinel', 'close failed sentinel'])
+    assert.equal(result.master, context.master)
+    assert.equal(result.replicas, context.replicas)
+    assert.equal(result.sentinelStatus, 'suspect')
+    assert.equal(getSentinelCandidateHealth(result, { host: 's1.local', port: 26379 }).status, 'down')
+    assert.equal(getSentinelCandidateHealth(result, { host: 's2.local', port: 26379 }).status, 'down')
+})
+
+test('getSentinelHealInterval uses option, context option, then default', () => {
+    assert.equal(getSentinelHealInterval({ options: { sentinelHealIntervalMs: 3000 } }, { intervalMs: 1000 }), 1000)
+    assert.equal(getSentinelHealInterval({ options: { sentinelHealIntervalMs: 3000 } }, {}), 3000)
+    assert.equal(getSentinelHealInterval({ options: {} }, {}), 1000)
+})
+
+test('createSentinelHealer starts timer and updates current context', async () => {
+    var scheduled = undefined
+    var cleared = undefined
+    var calls = []
+    var scheduler = {
+        setInterval: (fn, ms) => {
+            scheduled = { fn, ms }
+            return 'sentinel-heal-timer'
+        },
+        clearInterval: timer => {
+            cleared = timer
+        }
+    }
+    var sentinelClient = {
+        connect: async () => calls.push('connect sentinel'),
+        sendCommand: async (args) => {
+            if (args[1] === 'get-master-addr-by-name') return ['master', '6379']
+            return []
+        }
+    }
+    var context = Object.freeze({
+        mode: 'sentinel',
+        masterName: 'mymaster',
+        options: Object.freeze({ sentinelHealIntervalMs: 2222 }),
+        sentinelIndex: 0,
+        sentinels: Object.freeze([{ host: 's1.local', port: 26379 }]),
+        master: { key: 'master:6379', client: {}, status: 'up' },
+        replicas: Object.freeze([])
+    })
+    var healer = createSentinelHealer(context, {
+        scheduler,
+        createClient: () => sentinelClient,
+        dataCreateClient: () => {
+            throw new Error('should not connect data plane')
+        }
+    })
+
+    assert.equal(scheduled.ms, 2222)
+    assert.equal(healer.getContext(), context)
+
+    await healer.heal()
+
+    assert.deepEqual(calls, ['connect sentinel'])
+    assert.equal(healer.getContext().sentinel, sentinelClient)
+
+    healer.stop()
+
+    assert.equal(cleared, 'sentinel-heal-timer')
 })
 
 test('normalizeMaster creates stable master topology record', () => {
