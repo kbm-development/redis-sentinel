@@ -9,6 +9,11 @@ var {
     connectDirect,
     createSentinelClientOptions,
     connectSentinel,
+    normalizeMaster,
+    normalizeReplicas,
+    discoverMaster,
+    discoverReplicas,
+    discoverTopology,
     command,
     closeRedisContext
 } = require('./index')
@@ -319,6 +324,112 @@ test('connectSentinel rejects direct context', async () => {
     )
 })
 
+test('normalizeMaster creates stable master topology record', () => {
+    assert.deepEqual(normalizeMaster(['redis-master.local', '6379']), {
+        host: 'redis-master.local',
+        port: 6379,
+        key: 'redis-master.local:6379'
+    })
+})
+
+test('normalizeReplicas creates stable replica records and skips down replicas', () => {
+    var replicas = normalizeReplicas([
+        ['name', 'replica-a', 'ip', '10.0.0.2', 'port', '6379', 'flags', 'slave'],
+        ['name', 'replica-b', 'ip', '10.0.0.3', 'port', '6379', 'flags', 's_down,slave'],
+        ['name', 'replica-c', 'ip', '10.0.0.4', 'port', '6380', 'flags', 'slave']
+    ])
+
+    assert.deepEqual(replicas, [
+        { host: '10.0.0.2', port: 6379, key: '10.0.0.2:6379' },
+        { host: '10.0.0.4', port: 6380, key: '10.0.0.4:6380' }
+    ])
+})
+
+test('discoverMaster sends sentinel master command', async () => {
+    var sentArgs = undefined
+    var context = createInitialContext('redis+sentinel://s1.local:26379?sentinelMasterId=mymaster')
+    context = Object.freeze({
+        ...context,
+        sentinel: {
+            sendCommand: async (args) => {
+                sentArgs = args
+                return ['redis-master.local', '6379']
+            }
+        }
+    })
+    var master = await discoverMaster(context)
+
+    assert.deepEqual(sentArgs, ['SENTINEL', 'get-master-addr-by-name', 'mymaster'])
+    assert.deepEqual(master, {
+        host: 'redis-master.local',
+        port: 6379,
+        key: 'redis-master.local:6379'
+    })
+})
+
+test('discoverReplicas sends sentinel replicas command', async () => {
+    var sentArgs = undefined
+    var context = createInitialContext('redis+sentinel://s1.local:26379?sentinelMasterId=mymaster')
+    context = Object.freeze({
+        ...context,
+        sentinel: {
+            sendCommand: async (args) => {
+                sentArgs = args
+                return [[
+                    'name', 'replica-a',
+                    'ip', '10.0.0.2',
+                    'port', '6379',
+                    'flags', 'slave'
+                ]]
+            }
+        }
+    })
+    var replicas = await discoverReplicas(context)
+
+    assert.deepEqual(sentArgs, ['SENTINEL', 'replicas', 'mymaster'])
+    assert.deepEqual(replicas, [
+        { host: '10.0.0.2', port: 6379, key: '10.0.0.2:6379' }
+    ])
+})
+
+test('discoverTopology stores master and replicas without data connections', async () => {
+    var sentCommands = []
+    var context = createInitialContext('redis+sentinel://s1.local:26379?sentinelMasterId=mymaster')
+    context = Object.freeze({
+        ...context,
+        sentinel: {
+            sendCommand: async (args) => {
+                sentCommands.push(args)
+                if (args[1] === 'get-master-addr-by-name') return ['redis-master.local', '6379']
+                return [[
+                    'name', 'replica-a',
+                    'ip', '10.0.0.2',
+                    'port', '6379',
+                    'flags', 'slave'
+                ]]
+            }
+        }
+    })
+    var discovered = await discoverTopology(context)
+
+    assert.deepEqual(sentCommands, [
+        ['SENTINEL', 'get-master-addr-by-name', 'mymaster'],
+        ['SENTINEL', 'replicas', 'mymaster']
+    ])
+    assert.equal(discovered.master, undefined)
+    assert.deepEqual(discovered.replicas, [])
+    assert.deepEqual(discovered.topology, {
+        master: { host: 'redis-master.local', port: 6379, key: 'redis-master.local:6379' },
+        replicas: [{ host: '10.0.0.2', port: 6379, key: '10.0.0.2:6379' }]
+    })
+})
+
+test('discoverTopology validates sentinel context is connected', async () => {
+    var context = createInitialContext('redis+sentinel://s1.local:26379?sentinelMasterId=mymaster')
+
+    await assert.rejects(() => discoverTopology(context), /not connected/)
+})
+
 test('test real context data from direction connections', async () =>{
     if (!process.env.REDIS_URL) return;
     var context = createInitialContext(process.env.REDIS_URL);
@@ -327,7 +438,7 @@ test('test real context data from direction connections', async () =>{
 		context = await connectDirect(context);
 		assert.equal(context.master.role, 'master');
 		await command(['SET', 'foo', 'bar'], context);
-		let results = await command(['GET', 'foo'], context);
+		var results = await command(['GET', 'foo'], context);
 		assert.notEqual(results, null);
 		await closeRedisContext(context);
 	}
@@ -343,6 +454,22 @@ test('test real sentinel connections', async ()=>{
 			assert.notEqual(context.sentinels.length, 0);
 			context = await connectSentinel(context);
 			assert.notEqual(context.sentinel, null);
+		} finally {
+			await closeRedisContext(context);
+		}
+	}
+});
+
+test('test real sentinel topology discovery', async ()=>{
+	if (!process.env.REDIS_URL) return;
+    var context = createInitialContext(process.env.REDIS_URL);
+	if(context.mode === 'sentinel'){
+		try {
+			context = await connectSentinel(context);
+			context = await discoverTopology(context);
+			assert.notEqual(context.topology.master, null);
+			assert.notEqual(context.topology.master.key, null);
+			assert.equal(Array.isArray(context.topology.replicas), true);
 		} finally {
 			await closeRedisContext(context);
 		}
