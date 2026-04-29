@@ -18,6 +18,9 @@ var {
     connectRedisNode,
     connectTopology,
     applyTopology,
+    reconcileTopology,
+    getReconcileInterval,
+    createTopologyReconciler,
     classifyCommand,
     chooseReplica,
     command,
@@ -715,6 +718,134 @@ test('applyTopology does not close old master when new master connection fails',
 
     await assert.rejects(() => applyTopology(context, topology, () => failedNewMasterClient), /new master failed/)
     assert.deepEqual(calls, ['connect new master', 'close failed new master'])
+})
+
+test('reconcileTopology returns same context for unchanged topology', async () => {
+    var sentCommands = []
+    var context = Object.freeze({
+        mode: 'sentinel',
+        masterName: 'mymaster',
+        sentinel: {
+            sendCommand: async (args) => {
+                sentCommands.push(args)
+                if (args[1] === 'get-master-addr-by-name') return ['master', '6379']
+                return [['ip', 'replica-a', 'port', '6379', 'flags', 'slave']]
+            }
+        },
+        master: { key: 'master:6379', client: {}, status: 'up' },
+        replicas: Object.freeze([{ key: 'replica-a:6379', client: {}, status: 'up' }])
+    })
+    var result = await reconcileTopology(context, () => {
+        throw new Error('should not connect')
+    })
+
+    assert.equal(result, context)
+    assert.deepEqual(sentCommands, [
+        ['SENTINEL', 'get-master-addr-by-name', 'mymaster'],
+        ['SENTINEL', 'replicas', 'mymaster']
+    ])
+})
+
+test('reconcileTopology applies changed topology', async () => {
+    var calls = []
+    var newReplicaClient = { connect: async () => calls.push('connect new replica') }
+    var context = Object.freeze({
+        mode: 'sentinel',
+        masterName: 'mymaster',
+        sentinel: {
+            sendCommand: async (args) => {
+                if (args[1] === 'get-master-addr-by-name') return ['master', '6379']
+                return [
+                    ['ip', 'replica-a', 'port', '6379', 'flags', 'slave'],
+                    ['ip', 'replica-b', 'port', '6379', 'flags', 'slave']
+                ]
+            }
+        },
+        master: { key: 'master:6379', client: {}, status: 'up' },
+        replicas: Object.freeze([{ key: 'replica-a:6379', client: {}, status: 'up' }])
+    })
+    var result = await reconcileTopology(context, () => newReplicaClient)
+
+    assert.deepEqual(calls, ['connect new replica'])
+    assert.equal(result.sentinelStatus, 'up')
+    assert.equal(result.lastReconcileError, undefined)
+    assert.equal(result.replicas.length, 2)
+    assert.equal(result.replicas[1].key, 'replica-b:6379')
+})
+
+test('reconcileTopology marks sentinel suspect on discovery failure without closing data plane', async () => {
+    var calls = []
+    var masterClient = { close: async () => calls.push('close master') }
+    var replicaClient = { close: async () => calls.push('close replica') }
+    var context = Object.freeze({
+        mode: 'sentinel',
+        masterName: 'mymaster',
+        sentinel: {
+            sendCommand: async () => {
+                throw new Error('sentinel query failed')
+            }
+        },
+        master: { key: 'master:6379', client: masterClient, status: 'up' },
+        replicas: Object.freeze([{ key: 'replica-a:6379', client: replicaClient, status: 'up' }])
+    })
+    var result = await reconcileTopology(context)
+
+    assert.deepEqual(calls, [])
+    assert.equal(result.master, context.master)
+    assert.equal(result.replicas, context.replicas)
+    assert.equal(result.sentinelStatus, 'suspect')
+    assert.match(result.lastReconcileError.message, /sentinel query failed/)
+})
+
+test('getReconcileInterval uses option, context option, then default', () => {
+    assert.equal(getReconcileInterval({ options: { topologyIntervalMs: 7000 } }, { intervalMs: 1000 }), 1000)
+    assert.equal(getReconcileInterval({ options: { topologyIntervalMs: 7000 } }, {}), 7000)
+    assert.equal(getReconcileInterval({ options: {} }, {}), 5000)
+})
+
+test('createTopologyReconciler starts timer and updates current context', async () => {
+    var scheduled = undefined
+    var cleared = undefined
+    var calls = []
+    var scheduler = {
+        setInterval: (fn, ms) => {
+            scheduled = { fn, ms }
+            return 'timer-1'
+        },
+        clearInterval: timer => {
+            cleared = timer
+        }
+    }
+    var context = Object.freeze({
+        mode: 'sentinel',
+        masterName: 'mymaster',
+        options: Object.freeze({ topologyIntervalMs: 1234 }),
+        sentinel: {
+            sendCommand: async (args) => {
+                if (args[1] === 'get-master-addr-by-name') return ['master', '6379']
+                return [['ip', 'replica-b', 'port', '6379', 'flags', 'slave']]
+            }
+        },
+        master: { key: 'master:6379', client: {}, status: 'up' },
+        replicas: Object.freeze([])
+    })
+    var newReplicaClient = { connect: async () => calls.push('connect new replica') }
+    var reconciler = createTopologyReconciler(context, {
+        scheduler,
+        createClient: () => newReplicaClient
+    })
+
+    assert.equal(scheduled.ms, 1234)
+    assert.equal(reconciler.getContext(), context)
+
+    await reconciler.reconcile()
+
+    assert.deepEqual(calls, ['connect new replica'])
+    assert.equal(reconciler.getContext().replicas.length, 1)
+
+    reconciler.stop()
+
+    assert.equal(cleared, 'timer-1')
 })
 
 test('classifyCommand classifies reads, writes, and unknown commands', () => {
