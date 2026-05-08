@@ -1806,6 +1806,7 @@ test('classifyCommand classifies reads, writes, and unknown commands', () => {
     assert.equal(classifyCommand(['get', 'key']), 'read')
     assert.equal(classifyCommand(['HGETALL', 'hash']), 'read')
     assert.equal(classifyCommand(['XINFO', 'STREAM', 'stream']), 'read')
+    assert.equal(classifyCommand(['XREADGROUP', 'GROUP', 'g', 'c', 'STREAMS', 's', '>']), 'write')
     assert.equal(classifyCommand(['JSON.GET', 'doc']), 'read')
     assert.equal(classifyCommand(['FT.SEARCH', 'idx', '*']), 'read')
     assert.equal(classifyCommand(['TS.RANGE', 'series', '-', '+']), 'read')

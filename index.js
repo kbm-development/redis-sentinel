@@ -56,6 +56,7 @@ var WRITE_COMMANDS = new Set([
     'HSET', 'HSETNX', 'HMSET',
     'HINCRBY', 'HINCRBYFLOAT', 'HDEL',
     'XADD', 'XDEL', 'XTRIM',
+    'XREADGROUP',
     'XGROUP', 'XSETID',
     'XACK', 'XAUTOCLAIM', 'XCLAIM',
     'PUBLISH',
