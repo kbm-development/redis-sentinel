@@ -1002,11 +1002,20 @@ var getActiveContext = (context) => {
     return context
 }
 
+var ensureConnectedContext = async (context) => {
+    if (context && typeof context.connect === 'function' && typeof context.getContext === 'function') {
+        await context.connect()
+    }
+
+    return getActiveContext(context)
+}
+
 var command = async (args, context) => {
     if (!Array.isArray(args) || args.length === 0) {
         throw new Error('command args must be a non-empty array')
     }
 
+    context = await ensureConnectedContext(context)
     var client = getCommandClient(args, context)
     return client.sendCommand(args)
 }
@@ -1022,13 +1031,17 @@ var closeClient = async (client) => {
 var closeRedisContext = async (context) => {
     if (!context) return
 
+    if (context && typeof context.ready === 'object' && typeof context.ready.then === 'function') {
+        await context.ready.catch(() => undefined)
+    }
+
+    context = getActiveContext(context)
+
     var hasSentinelEvents = Boolean(context.sentinelEvents)
 
     if (context.topologyReconciler) context.topologyReconciler.stop()
     if (context.sentinelHealer) context.sentinelHealer.stop()
     if (context.sentinelEvents) await context.sentinelEvents.stop()
-
-    context = getActiveContext(context)
 
     if (context.master) await closeClient(context.master.client)
 
@@ -1069,7 +1082,7 @@ var attachBackground = async (context, options = {}) => {
     })
 }
 
-var createRedis = async (uri, options = {}) => {
+var createConnectedRedis = async (uri, options = {}) => {
     var createClient = options.createClient || createRedisClient
     var dataCreateClient = options.dataCreateClient || createClient
     var context = createInitialContext(uri, options)
@@ -1082,10 +1095,43 @@ var createRedis = async (uri, options = {}) => {
     return attachBackground(context, options)
 }
 
+var createRedis = (uri, options = {}) => {
+    var current = createInitialContext(uri, options)
+    var ready = undefined
+    var wrapper = undefined
+    var connect = async () => {
+        if (!ready) {
+            ready = createConnectedRedis(uri, options).then((context) => {
+                current = context
+                return context
+            })
+        }
+
+        await ready
+        return current
+    }
+
+    wrapper = Object.freeze({
+        getContext: () => current,
+        connect,
+        get ready() {
+            return ready || connect()
+        },
+        then: (resolve, reject) => connect().then(() => resolve(current), reject),
+        catch: (reject) => connect().catch(reject),
+        finally: (handler) => connect().finally(handler)
+    })
+
+    if (options.autoConnect !== false) connect().catch(() => undefined)
+
+    return wrapper
+}
+
 var closeRedis = async (context) => closeRedisContext(context)
 
 module.exports = {
     createRedis,
+    createConnectedRedis,
     closeRedis,
     parseRedisUrl,
     createInitialContext,
@@ -1160,6 +1206,7 @@ module.exports = {
     chooseReplica,
     getCommandClient,
     getActiveContext,
+    ensureConnectedContext,
     attachBackground,
     command,
     closeRedisContext

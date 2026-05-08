@@ -189,6 +189,57 @@ test('createRedis public api connects direct mode', async () => {
     assert.deepEqual(calls, ['connect direct', ['GET', 'key'], 'close direct'])
 })
 
+test('createRedis public api can be created without await and command waits for ready', async () => {
+    var calls = []
+    var fakeClient = {
+        connect: async () => calls.push('connect direct'),
+        sendCommand: async (args) => {
+            calls.push(args)
+            return 'direct-value'
+        },
+        close: async () => calls.push('close direct')
+    }
+    var rs = createRedis('redis://redis.local:6379', {
+        createClient: () => fakeClient
+    })
+    var result = await command(['GET', 'key'], rs)
+
+    assert.equal(rs.getContext().mode, 'direct')
+    assert.equal(rs.getContext().master.client, fakeClient)
+    assert.equal(result, 'direct-value')
+
+    await closeRedis(rs)
+
+    assert.deepEqual(calls, ['connect direct', ['GET', 'key'], 'close direct'])
+})
+
+test('createRedis public api supports manual connect when autoConnect is false', async () => {
+    var calls = []
+    var fakeClient = {
+        connect: async () => calls.push('connect direct'),
+        sendCommand: async (args) => {
+            calls.push(args)
+            return 'manual-value'
+        },
+        close: async () => calls.push('close direct')
+    }
+    var rs = createRedis('redis://redis.local:6379', {
+        autoConnect: false,
+        createClient: () => fakeClient
+    })
+
+    assert.equal(rs.getContext().master, undefined)
+
+    await rs.connect()
+
+    assert.equal(rs.getContext().master.client, fakeClient)
+    assert.equal(await command(['GET', 'key'], rs), 'manual-value')
+
+    await closeRedis(rs)
+
+    assert.deepEqual(calls, ['connect direct', ['GET', 'key'], 'close direct'])
+})
+
 test('createRedis public api connects sentinel mode through topology', async () => {
     var calls = []
     var intervals = []

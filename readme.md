@@ -55,16 +55,45 @@ npm install git+https://github.com/kbm-development/redis-sentinel.git
 
 ## Usage
 
+Create the Redis handle once during application startup. The handle can be used immediately; commands wait for the initial connection to finish.
+
 ```js
 var { createRedis, command, closeRedis } = require('redis-sentinel')
 
-var redis = await createRedis(process.env.REDIS_URL)
+var redis = createRedis(process.env.REDIS_URL)
 
 await command(['SET', 'key', 'value'], redis)
 var value = await command(['GET', 'key'], redis)
 
 await closeRedis(redis)
 ```
+
+If the application prefers explicit startup sequencing, `createRedis()` can still be awaited:
+
+```js
+var redis = await createRedis(process.env.REDIS_URL)
+```
+
+For manual connection control, disable auto-connect and call `connect()` yourself:
+
+```js
+var redis = createRedis(process.env.REDIS_URL, { autoConnect: false })
+
+await redis.connect()
+await command(['PING'], redis)
+await closeRedis(redis)
+```
+
+If code needs to duplicate the active master client directly, for example a blocking stream reader, wait for Redis readiness before reading `context.master.client`:
+
+```js
+var redis = createRedis(process.env.REDIS_URL)
+
+await redis.connect()
+startStreams(redis)
+```
+
+Normal `command()` calls do this wait internally. Direct client duplication cannot, unless the stream helper explicitly waits first.
 
 ## Connection Strings
 
@@ -98,7 +127,16 @@ The Sentinel URI points to Sentinel nodes, not Redis master or replica nodes.
 - Background reconciliation keeps topology fresh.
 - Sentinel pub/sub events trigger debounced reconciliation.
 - Sentinel failures do not kill active master/replica connections.
+- `command()` waits for the initial connection when given a newly created Redis handle.
 - Failed foreground commands are returned to the caller without automatic retry.
+
+## Lifecycle
+
+- `createRedis(url)` returns a Redis handle and starts connecting in the background.
+- `await createRedis(url)` waits for the initial connection before continuing.
+- `createRedis(url, { autoConnect: false })` creates a handle without opening sockets until `await redis.connect()`.
+- Stream readers that duplicate `context.master.client` should start after `await redis.connect()` or should perform the same readiness wait inside the reader helper.
+- `closeRedis(redis)` waits for any in-progress connection attempt and then closes Redis, Sentinel, background, and subscriber resources.
 
 ## Deployment Note
 
