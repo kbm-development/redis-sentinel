@@ -940,22 +940,10 @@ var createSentinelEventSubscription = async (context, reconciler, options = {}) 
 }
 
 var getDirectClient = (context) => {
-    if (!context || context.mode !== 'direct') {
-        throw new Error('direct command requires a direct redis context')
-    }
-
-    if (!context.master || !context.master.client) {
-        throw new Error('direct redis context is not connected')
-    }
-
     return context.master.client
 }
 
 var getMasterClient = (context) => {
-    if (!context.master || !context.master.client) {
-        throw new Error('master redis connection is not available')
-    }
-
     return context.master.client
 }
 
@@ -963,9 +951,7 @@ var classifyCommand = (args) => {
     if (!Array.isArray(args) || args.length === 0) {
         throw new Error('command args must be a non-empty array')
     }
-
     var name = String(args[0]).toUpperCase()
-
     if (READ_COMMANDS.has(name)) return 'read'
     if (WRITE_COMMANDS.has(name)) return 'write'
     return 'write'
