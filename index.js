@@ -979,14 +979,15 @@ var chooseReplica = (context) => {
     return (context.replicas || []).find(isHealthyConnection)
 }
 
+var getActiveContext = (context) => {
+    if (context && typeof context.getContext === 'function') return context.getContext()
+    return context
+}
+
 var getCommandClient = (args, context) => {
     context = getActiveContext(context)
 
     if (context.mode === 'direct') return getDirectClient(context)
-
-    if (context.mode !== 'sentinel') {
-        throw new Error('unknown redis context mode')
-    }
 
     var type = classifyCommand(args)
     if (type === 'read') {
@@ -997,10 +998,6 @@ var getCommandClient = (args, context) => {
     return getMasterClient(context)
 }
 
-var getActiveContext = (context) => {
-    if (context && typeof context.getContext === 'function') return context.getContext()
-    return context
-}
 
 var command = async (args, context) => {
     if (!Array.isArray(args) || args.length === 0) {
