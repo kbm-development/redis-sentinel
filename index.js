@@ -975,10 +975,6 @@ var createSentinelEventSubscription = async (context, reconciler, options = {}) 
 }
 
 var getDirectClient = (context) => {
-    if (!context || context.mode !== 'direct') {
-        throw new Error('direct command requires a direct redis context')
-    }
-
     if (!context.master || !context.master.client) {
         throw new Error('direct redis context is not connected')
     }
@@ -988,7 +984,7 @@ var getDirectClient = (context) => {
 
 var getMasterClient = (context) => {
     if (!context.master || !context.master.client) {
-        throw new Error('master redis connection is not available')
+        throw new Error('sentinel redis context master is not connected')
     }
 
     return context.master.client
@@ -998,9 +994,7 @@ var classifyCommand = (args) => {
     if (!Array.isArray(args) || args.length === 0) {
         throw new Error('command args must be a non-empty array')
     }
-
     var name = String(args[0]).toUpperCase()
-
     if (READ_COMMANDS.has(name)) return 'read'
     if (WRITE_COMMANDS.has(name)) return 'write'
     return 'write'
@@ -1015,13 +1009,7 @@ var chooseReplica = (context) => {
 }
 
 var getCommandClient = (args, context) => {
-    context = getActiveContext(context)
-
     if (context.mode === 'direct') return getDirectClient(context)
-
-    if (context.mode !== 'sentinel') {
-        throw new Error('unknown redis context mode')
-    }
 
     var type = classifyCommand(args)
     if (type === 'read') {
@@ -1032,10 +1020,6 @@ var getCommandClient = (args, context) => {
     return getMasterClient(context)
 }
 
-var getActiveContext = (context) => {
-    if (context && typeof context.getContext === 'function') return context.getContext()
-    return context
-}
 
 var command = async (args, context) => {
     if (!Array.isArray(args) || args.length === 0) {
@@ -1057,13 +1041,15 @@ var closeClient = async (client) => {
 var closeRedisContext = async (context) => {
     if (!context) return
 
+    if (context && typeof context.ready === 'object' && typeof context.ready.then === 'function') {
+        await context.ready.catch(() => undefined)
+    }
+
     var hasSentinelEvents = Boolean(context.sentinelEvents)
 
     if (context.topologyReconciler) context.topologyReconciler.stop()
     if (context.sentinelHealer) context.sentinelHealer.stop()
     if (context.sentinelEvents) await context.sentinelEvents.stop()
-
-    context = getActiveContext(context)
 
     if (context.master) await closeClient(context.master.client)
 
@@ -1099,8 +1085,7 @@ var attachBackground = async (context, options = {}) => {
         sentinelSubscriber: sentinelEvents.context.sentinelSubscriber,
         topologyReconciler,
         sentinelHealer,
-        sentinelEvents,
-        getContext: () => topologyReconciler.getContext()
+        sentinelEvents
     })
 }
 
@@ -1114,9 +1099,6 @@ var connectRedis = async (context) => {
     var options = context.options || {}
     var createClient = options.createClient || createRedisClient
     var dataCreateClient = options.dataCreateClient || createClient
-
-    if (context.mode === 'direct') return connectDirect(context, createClient)
-
     if (context.mode !== 'sentinel') throw new Error('unknown redis context mode')
 
     context = await connectSentinel(context, createClient)
@@ -1277,13 +1259,13 @@ module.exports = {
     subscribeSentinelChannels,
     createDebouncedReconcile,
     createSentinelEventSubscription,
+    discoverRedis,
     READ_COMMANDS,
     WRITE_COMMANDS,
     classifyCommand,
     isHealthyConnection,
     chooseReplica,
     getCommandClient,
-    getActiveContext,
     attachBackground,
     command,
     closeRedisContext

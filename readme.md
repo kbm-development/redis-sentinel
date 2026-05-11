@@ -55,15 +55,44 @@ npm install git+https://github.com/kbm-development/redis-sentinel.git
 
 ## Usage
 
-```js
-var { createRedis, command, closeRedis } = require('redis-sentinel')
+Create the Redis context once during application startup. `createRedis()` returns a plain context object immediately. Lifecycle functions are functional: they take a context and return the next context.
 
-var redis = await createRedis(process.env.REDIS_URL)
+```js
+var { createRedis, connectRedis, command, closeRedis } = require('redis-sentinel')
+
+var redis = createRedis(process.env.REDIS_URL)
+
+var discovered = await redis.ready
+console.log(discovered.topology.master)
+
+redis = await connectRedis(discovered)
 
 await command(['SET', 'key', 'value'], redis)
 var value = await command(['GET', 'key'], redis)
 
 await closeRedis(redis)
+```
+
+Blocking stream readers should use their own Redis context instead of duplicating the shared command client. Clone the discovered context and connect only its master connection:
+
+```js
+var { createRedis, connectRedis, connectMasterRedis, cloneRedis } = require('redis-sentinel')
+
+var redis = createRedis(process.env.REDIS_URL)
+
+var discovered = await redis.ready
+redis = await connectRedis(discovered)
+
+var streamRedis = cloneRedis(redis)
+streamRedis = await connectMasterRedis(streamRedis)
+
+startStreams(streamRedis)
+```
+
+The stream reader can keep using `command(args, streamRedis)`. This keeps blocking commands off the shared command connection and avoids depending on `context.master.client.duplicate()` during startup:
+
+```js
+await command(['XREADGROUP', 'GROUP', group, consumer, 'BLOCK', '0', 'STREAMS', key, '>'], streamRedis)
 ```
 
 ## Connection Strings
@@ -95,10 +124,24 @@ The Sentinel URI points to Sentinel nodes, not Redis master or replica nodes.
 - Reads go to a healthy replica when available.
 - Reads fall back to master if no healthy replica exists.
 - Unknown commands are treated as writes and sent to master.
-- Background reconciliation keeps topology fresh.
+- `createRedis()` starts Sentinel discovery but does not start data-plane Redis connections or background watchers.
+- `connectRedis()` connects master/replica data-plane clients and starts background reconciliation/watchers.
+- Background reconciliation keeps topology fresh after `connectRedis()`.
 - Sentinel pub/sub events trigger debounced reconciliation.
 - Sentinel failures do not kill active master/replica connections.
 - Failed foreground commands are returned to the caller without automatic retry.
+
+## Lifecycle
+
+- `createRedis(url)` returns a plain context object immediately.
+- The returned context has no object methods like `getContext()` or `setContext()`.
+- `redis.ready` resolves to a new discovered context with `topology` populated.
+- `connectRedis(redis)` returns a new context with shared master/replica clients and background work started.
+- `cloneRedis(redis)` creates a separate context from the same discovered topology.
+- `connectMasterRedis(clone)` returns a new context with only the clone's master client connected, which is useful for blocking stream readers.
+- `command(args, redis)` routes through the shared command connections.
+- Blocking stream readers should use a cloned master-only context instead of using `.duplicate()` on `context.master.client`.
+- `closeRedis(redis)` closes Redis, Sentinel, background, and subscriber resources owned by that context.
 
 ## Deployment Note
 

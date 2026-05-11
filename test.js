@@ -201,12 +201,20 @@ test('connectRedis public api connects direct mode', async () => {
     })
     context = await connectRedis(context)
     var result = await command(['GET', 'key'], context)
+    assert.equal(context.mode, 'direct')
+    assert.equal(context.master, undefined)
+    assert.equal(context.getContext, undefined)
+
+    var connected = await connectRedis(context)
+
+    var connectedResult = await command(['GET', 'key'], connected)
 
     assert.equal(context.mode, 'direct')
-    assert.equal(context.master.client, fakeClient)
-    assert.equal(result, 'direct-value')
+    assert.equal(context.master, undefined)
+    assert.equal(connected.master.client, fakeClient)
+    assert.equal(connectedResult, 'direct-value')
 
-    await closeRedis(context)
+    await closeRedis(connected)
 
     assert.deepEqual(calls, ['connect direct', ['GET', 'key'], 'close direct'])
 })
@@ -274,18 +282,40 @@ test('connectRedis public api connects sentinel mode through topology', async ()
     var readResult = await command(['GET', 'key'], context)
 
     assert.equal(context.mode, 'sentinel')
-    assert.equal(context.sentinel, sentinelClient)
-    assert.equal(context.sentinelSubscriber, subscriberClient)
-    assert.equal(context.master.client, masterClient)
-    assert.equal(context.replicas[0].client, replicaClient)
-    assert.notEqual(context.topologyReconciler, undefined)
-    assert.notEqual(context.sentinelHealer, undefined)
-    assert.notEqual(context.sentinelEvents, undefined)
+    assert.equal(context.master, undefined)
+    assert.equal(context.getContext, undefined)
+
+    var discovered = await context.ready
+
+    assert.equal(context.sentinel, undefined)
+    assert.equal(context.topology, undefined)
+    assert.equal(discovered.sentinel, sentinelClient)
+    assert.equal(discovered.topology.master.host, 'master.local')
+    assert.equal(discovered.topology.replicas[0].host, 'replica.local')
+    assert.equal(intervals.length, 0)
+
+    var connected = await connectRedis(context)
+
+    assert.notEqual(connected, context)
+    assert.equal(connected.getContext, undefined)
+
+    var writeResult = await command(['SET', 'key', 'value'], connected)
+    var readResult = await command(['GET', 'key'], connected)
+
+    assert.equal(context.mode, 'sentinel')
+    assert.equal(context.sentinel, undefined)
+    assert.equal(connected.sentinel, sentinelClient)
+    assert.equal(connected.sentinelSubscriber, subscriberClient)
+    assert.equal(connected.master.client, masterClient)
+    assert.equal(connected.replicas[0].client, replicaClient)
+    assert.notEqual(connected.topologyReconciler, undefined)
+    assert.notEqual(connected.sentinelHealer, undefined)
+    assert.notEqual(connected.sentinelEvents, undefined)
     assert.equal(intervals.length, 2)
     assert.equal(writeResult, 'ok')
     assert.equal(readResult, 'value')
 
-    await closeRedis(context)
+    await closeRedis(connected)
 
     assert.equal(clearedIntervals.length, 2)
     assert.deepEqual(calls, [
@@ -2018,6 +2048,7 @@ test('classifyCommand classifies reads, writes, and unknown commands', () => {
     assert.equal(classifyCommand(['get', 'key']), 'read')
     assert.equal(classifyCommand(['HGETALL', 'hash']), 'read')
     assert.equal(classifyCommand(['XINFO', 'STREAM', 'stream']), 'read')
+    assert.equal(classifyCommand(['XREADGROUP', 'GROUP', 'g', 'c', 'STREAMS', 's', '>']), 'write')
     assert.equal(classifyCommand(['JSON.GET', 'doc']), 'read')
     assert.equal(classifyCommand(['FT.SEARCH', 'idx', '*']), 'read')
     assert.equal(classifyCommand(['TS.RANGE', 'series', '-', '+']), 'read')
