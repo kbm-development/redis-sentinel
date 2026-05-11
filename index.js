@@ -1259,7 +1259,6 @@ module.exports = {
     subscribeSentinelChannels,
     createDebouncedReconcile,
     createSentinelEventSubscription,
-    discoverRedis,
     READ_COMMANDS,
     WRITE_COMMANDS,
     classifyCommand,
