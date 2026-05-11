@@ -1027,12 +1027,14 @@ var getCommandClient = (args, context) => {
     return getMasterClient(context)
 }
 
+var isFn = (value) => typeof value === 'function'
+
 
 var command = async (args, context) => {
     if (!Array.isArray(args) || args.length === 0) {
         throw new Error('command args must be a non-empty array')
     }
-
+	if(isFn(context)) context = context();
     var client = getCommandClient(args, context)
     return client.sendCommand(args)
 }
