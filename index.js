@@ -976,7 +976,7 @@ var createSentinelEventSubscription = async (context, reconciler, options = {}) 
 
 var getDirectClient = (context) => {
     if (!context.master || !context.master.client) {
-        throw new Error('direct redis context is not connected')
+        //throw new Error('direct redis context is not connected')
     }
 
     return context.master.client
@@ -984,7 +984,7 @@ var getDirectClient = (context) => {
 
 var getMasterClient = (context) => {
     if (!context.master || !context.master.client) {
-        throw new Error('sentinel redis context master is not connected')
+        //throw new Error('sentinel redis context master is not connected')
     }
 
     return context.master.client
