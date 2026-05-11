@@ -154,4 +154,14 @@ var command = async (...args) =>{
 };
 
 
-module.exports = { command, createRedis: redis.createRedis, connectRedis: redis.connectRedis };
+module.exports = { 
+	command, 
+	createRedis: redis.createRedis, 
+	connectRedis: redis.connectRedis,
+	cloneRedis: redis.cloneRedis,
+    connectMaster: redis.connectMaster,
+    closeRedis : redis.closeRedis,
+    parsePort: redis.parsePort,
+    getCommandClient: redis.getCommandClient,
+    getActiveContext: redis.getActiveContext
+};
