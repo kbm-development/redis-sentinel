@@ -1139,6 +1139,10 @@ var connectMasterRedis = async (context, options = {}) => {
     var active = await (context && context.ready ? context.ready : Promise.resolve(context))
     active = getActiveContext(active)
 
+    if (!active || !active.uri) {
+        throw new Error('connectMasterRedis requires a redis context returned by createRedis')
+    }
+
     var createClient = options.createClient || options.dataCreateClient || active.options.dataCreateClient || active.options.createClient || createRedisClient
     var nextContext = undefined
 
@@ -1165,6 +1169,10 @@ var connectRedis = async (context, options = {}) => {
     var active = await (context && context.ready ? context.ready : Promise.resolve(context))
     active = getActiveContext(active)
 
+    if (!active || !active.uri) {
+        throw new Error('connectRedis requires a redis context returned by createRedis')
+    }
+
     var createClient = options.createClient || active.options.createClient || createRedisClient
     var dataCreateClient = options.dataCreateClient || active.options.dataCreateClient || createClient
     var nextContext = undefined
@@ -1185,6 +1193,11 @@ var connectRedis = async (context, options = {}) => {
 
 var cloneRedis = (context, options = {}) => {
     var active = getActiveContext(context)
+
+    if (!active || !active.uri) {
+        throw new Error('cloneRedis requires a redis context returned by createRedis, not a Promise or empty value')
+    }
+
     var nextContext = createInitialContext(active.uri, {
         ...active.options,
         ...options
@@ -1205,8 +1218,11 @@ var closeRedis = async (context) => closeRedisContext(context)
 module.exports = {
     createRedis,
     connectRedis,
+    connect: connectRedis,
     connectMasterRedis,
+    connectMaster: connectMasterRedis,
     cloneRedis,
+    clone: cloneRedis,
     closeRedis,
     parseRedisUrl,
     createInitialContext,

@@ -3,6 +3,12 @@
 var assert = require('node:assert/strict')
 var {
     createRedis,
+    connectRedis,
+    connect,
+    connectMasterRedis,
+    connectMaster,
+    cloneRedis,
+    clone,
     closeRedis,
     parseRedisUrl,
     createInitialContext,
@@ -165,7 +171,7 @@ test('createInitialContext from env REDIS_URL only sentinel', ()=>{
 	assert.equal(1,1) // just pass
 })
 
-test('createRedis public api connects direct mode', async () => {
+test('createRedis public api returns direct context immediately and connectRedis starts it', async () => {
     var calls = []
     var fakeClient = {
         connect: async () => calls.push('connect direct'),
@@ -175,9 +181,15 @@ test('createRedis public api connects direct mode', async () => {
         },
         close: async () => calls.push('close direct')
     }
-    var context = await createRedis('redis://redis.local:6379', {
+    var context = createRedis('redis://redis.local:6379', {
         createClient: () => fakeClient
     })
+
+    assert.equal(context.mode, 'direct')
+    assert.equal(context.master, undefined)
+
+    await connectRedis(context)
+
     var result = await command(['GET', 'key'], context)
 
     assert.equal(context.mode, 'direct')
@@ -189,7 +201,7 @@ test('createRedis public api connects direct mode', async () => {
     assert.deepEqual(calls, ['connect direct', ['GET', 'key'], 'close direct'])
 })
 
-test('createRedis public api connects sentinel mode through topology', async () => {
+test('createRedis public api discovers sentinel topology before connectRedis starts data plane', async () => {
     var calls = []
     var intervals = []
     var clearedIntervals = []
@@ -239,11 +251,24 @@ test('createRedis public api connects sentinel mode through topology', async () 
     }
     var sentinelClients = [sentinelClient, subscriberClient]
     var dataClients = [masterClient, replicaClient]
-    var context = await createRedis('redis+sentinel://s1.local:26379?sentinelMasterId=mymaster', {
+    var context = createRedis('redis+sentinel://s1.local:26379?sentinelMasterId=mymaster', {
         createClient: () => sentinelClients.shift(),
         dataCreateClient: () => dataClients.shift(),
         scheduler
     })
+
+    assert.equal(context.mode, 'sentinel')
+    assert.equal(context.master, undefined)
+
+    await context.ready
+
+    assert.equal(context.sentinel, sentinelClient)
+    assert.equal(context.topology.master.host, 'master.local')
+    assert.equal(context.topology.replicas[0].host, 'replica.local')
+    assert.equal(intervals.length, 0)
+
+    await connectRedis(context)
+
     var writeResult = await command(['SET', 'key', 'value'], context)
     var readResult = await command(['GET', 'key'], context)
 
@@ -282,6 +307,99 @@ test('createRedis public api connects sentinel mode through topology', async () 
         'close replica',
         'close sentinel'
     ])
+})
+
+test('cloneRedis creates separate master-only context for stream readers', async () => {
+    var calls = []
+    var sentinelClient = {
+        connect: async () => calls.push('connect sentinel'),
+        sendCommand: async (args) => {
+            calls.push(args)
+            if (args[1] === 'get-master-addr-by-name') return ['master.local', '6379']
+            return []
+        },
+        close: async () => calls.push('close sentinel')
+    }
+    var masterClient = {
+        connect: async () => calls.push('connect stream master'),
+        sendCommand: async (args) => {
+            calls.push(['stream command', args])
+            return 'stream-value'
+        },
+        close: async () => calls.push('close stream master')
+    }
+    var context = createRedis('redis+sentinel://s1.local:26379?sentinelMasterId=mymaster', {
+        createClient: () => sentinelClient,
+        dataCreateClient: () => masterClient
+    })
+
+    await context.ready
+
+    var streamContext = cloneRedis(context)
+    await connectMasterRedis(streamContext)
+
+    assert.equal(streamContext.topology.master.host, 'master.local')
+    assert.equal(streamContext.master.client, masterClient)
+    assert.equal(await command(['XREADGROUP', 'GROUP', 'g', 'c', 'STREAMS', 's', '>'], streamContext), 'stream-value')
+
+    await closeRedis(streamContext)
+    await closeRedis(context)
+
+    assert.deepEqual(calls, [
+        'connect sentinel',
+        ['SENTINEL', 'get-master-addr-by-name', 'mymaster'],
+        ['SENTINEL', 'replicas', 'mymaster'],
+        'connect stream master',
+        ['stream command', ['XREADGROUP', 'GROUP', 'g', 'c', 'STREAMS', 's', '>']],
+        'close stream master',
+        'close sentinel'
+    ])
+})
+
+test('connect and clone aliases support migration adapter names', async () => {
+    var calls = []
+    var directClient = {
+        connect: async () => calls.push('connect direct'),
+        sendCommand: async () => 'ok',
+        close: async () => calls.push('close direct')
+    }
+    var streamClient = {
+        connect: async () => calls.push('connect stream'),
+        sendCommand: async () => 'stream-ok',
+        close: async () => calls.push('close stream')
+    }
+    var clients = [directClient, streamClient]
+    var context = createRedis('redis://redis.local:6379', {
+        createClient: () => clients.shift()
+    })
+
+    await connect(context)
+
+    var streamContext = clone(context)
+    await connectMaster(streamContext)
+
+    assert.equal(await command(['GET', 'key'], streamContext), 'stream-ok')
+
+    await closeRedis(streamContext)
+    await closeRedis(context)
+
+    assert.deepEqual(calls, [
+        'connect direct',
+        'connect stream',
+        'close stream',
+        'close direct'
+    ])
+})
+
+test('cloneRedis rejects promises and empty values with migration error', async () => {
+    assert.throws(
+        () => cloneRedis(Promise.resolve(createInitialContext('redis://redis.local:6379'))),
+        /cloneRedis requires a redis context returned by createRedis/
+    )
+    assert.throws(
+        () => cloneRedis(undefined),
+        /cloneRedis requires a redis context returned by createRedis/
+    )
 })
 
 
