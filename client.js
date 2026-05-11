@@ -1,4 +1,4 @@
-var redis = require('redis-sentinel')
+var redis = require('./index')
 
 var isString = (value) => typeof value === 'string'
 var isObject = (value) => typeof value === 'object' && value !== null && !Array.isArray(value);
