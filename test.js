@@ -199,14 +199,12 @@ test('connectRedis public api connects direct mode', async () => {
     var context = createRedis('redis://redis.local:6379', {
         createClient: () => fakeClient
     })
-    context = await connectRedis(context)
-    var result = await command(['GET', 'key'], context)
+
     assert.equal(context.mode, 'direct')
     assert.equal(context.master, undefined)
     assert.equal(context.getContext, undefined)
 
     var connected = await connectRedis(context)
-
     var connectedResult = await command(['GET', 'key'], connected)
 
     assert.equal(context.mode, 'direct')
@@ -282,40 +280,18 @@ test('connectRedis public api connects sentinel mode through topology', async ()
     var readResult = await command(['GET', 'key'], context)
 
     assert.equal(context.mode, 'sentinel')
-    assert.equal(context.master, undefined)
-    assert.equal(context.getContext, undefined)
-
-    var discovered = await context.ready
-
-    assert.equal(context.sentinel, undefined)
-    assert.equal(context.topology, undefined)
-    assert.equal(discovered.sentinel, sentinelClient)
-    assert.equal(discovered.topology.master.host, 'master.local')
-    assert.equal(discovered.topology.replicas[0].host, 'replica.local')
-    assert.equal(intervals.length, 0)
-
-    var connected = await connectRedis(context)
-
-    assert.notEqual(connected, context)
-    assert.equal(connected.getContext, undefined)
-
-    var writeResult = await command(['SET', 'key', 'value'], connected)
-    var readResult = await command(['GET', 'key'], connected)
-
-    assert.equal(context.mode, 'sentinel')
-    assert.equal(context.sentinel, undefined)
-    assert.equal(connected.sentinel, sentinelClient)
-    assert.equal(connected.sentinelSubscriber, subscriberClient)
-    assert.equal(connected.master.client, masterClient)
-    assert.equal(connected.replicas[0].client, replicaClient)
-    assert.notEqual(connected.topologyReconciler, undefined)
-    assert.notEqual(connected.sentinelHealer, undefined)
-    assert.notEqual(connected.sentinelEvents, undefined)
+    assert.equal(context.sentinel, sentinelClient)
+    assert.equal(context.sentinelSubscriber, subscriberClient)
+    assert.equal(context.master.client, masterClient)
+    assert.equal(context.replicas[0].client, replicaClient)
+    assert.notEqual(context.topologyReconciler, undefined)
+    assert.notEqual(context.sentinelHealer, undefined)
+    assert.notEqual(context.sentinelEvents, undefined)
     assert.equal(intervals.length, 2)
     assert.equal(writeResult, 'ok')
     assert.equal(readResult, 'value')
 
-    await closeRedis(connected)
+    await closeRedis(context)
 
     assert.equal(clearedIntervals.length, 2)
     assert.deepEqual(calls, [

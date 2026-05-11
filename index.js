@@ -1008,7 +1008,14 @@ var chooseReplica = (context) => {
     return (context.replicas || []).find(isHealthyConnection)
 }
 
+var getActiveContext = (context) => {
+    if (context && typeof context.getContext === 'function') return context.getContext()
+    return context
+}
+
 var getCommandClient = (args, context) => {
+    context = getActiveContext(context)
+
     if (context.mode === 'direct') return getDirectClient(context)
 
     var type = classifyCommand(args)
@@ -1085,7 +1092,8 @@ var attachBackground = async (context, options = {}) => {
         sentinelSubscriber: sentinelEvents.context.sentinelSubscriber,
         topologyReconciler,
         sentinelHealer,
-        sentinelEvents
+        sentinelEvents,
+        getContext: () => topologyReconciler.getContext()
     })
 }
 
@@ -1099,6 +1107,9 @@ var connectRedis = async (context) => {
     var options = context.options || {}
     var createClient = options.createClient || createRedisClient
     var dataCreateClient = options.dataCreateClient || createClient
+
+    if (context.mode === 'direct') return connectDirect(context, createClient)
+
     if (context.mode !== 'sentinel') throw new Error('unknown redis context mode')
 
     context = await connectSentinel(context, createClient)
@@ -1265,6 +1276,7 @@ module.exports = {
     isHealthyConnection,
     chooseReplica,
     getCommandClient,
+    getActiveContext,
     attachBackground,
     command,
     closeRedisContext
