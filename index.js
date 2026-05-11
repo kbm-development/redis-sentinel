@@ -56,7 +56,7 @@ var WRITE_COMMANDS = new Set([
     'HSET', 'HSETNX', 'HMSET',
     'HINCRBY', 'HINCRBYFLOAT', 'HDEL',
     'XADD', 'XDEL', 'XTRIM',
-    'XGROUP', 'XSETID',
+    'XGROUP', 'XSETID', 'XREADGROUP',
     'XACK', 'XAUTOCLAIM', 'XCLAIM',
     'PUBLISH',
     'MULTI', 'EXEC', 'DISCARD', 'WATCH', 'UNWATCH',
@@ -670,6 +670,10 @@ var connectTopology = async (context, createClient = createRedisClient) => {
     })
 }
 
+var createDisconnectedReplicaRecords = (replicas = []) => Object.freeze(replicas.map(replica => {
+    return createDownConnectionRecord('replica', replica)
+}))
+
 var indexConnectionsByKey = (connections = []) => {
     var byKey = new Map()
 
@@ -755,6 +759,36 @@ var applyTopology = async (context, nextTopology, createClient = createRedisClie
     })
 }
 
+var applyMasterTopology = async (context, nextTopology, createClient = createRedisClient) => {
+    if (!context || context.mode !== 'sentinel') {
+        throw new Error('applyMasterTopology requires a sentinel redis context')
+    }
+
+    if (!nextTopology || !nextTopology.master) {
+        throw new Error('applyMasterTopology requires discovered topology')
+    }
+
+    if (isSameTopology(context, nextTopology) && context.master && context.master.client) return context
+
+    var masterChanged = !context.master || context.master.key !== nextTopology.master.key
+    var oldMaster = context.master
+    var master = masterChanged || !context.master.client
+        ? await connectRedisNode('master', nextTopology.master, context, createClient)
+        : context.master
+
+    if (masterChanged && oldMaster) await closeClient(oldMaster.client)
+
+    return Object.freeze({
+        ...context,
+        master,
+        replicas: createDisconnectedReplicaRecords(nextTopology.replicas || []),
+        topology: Object.freeze({
+            master: nextTopology.master,
+            replicas: Object.freeze(nextTopology.replicas || [])
+        })
+    })
+}
+
 var isMasterChanged = (context, topology) => {
     return Boolean(context.master && topology && topology.master && context.master.key !== topology.master.key)
 }
@@ -803,7 +837,9 @@ var markSentinelUp = (context) => {
 var reconcileTopology = async (context, createClient = createRedisClient) => {
     try {
         var discovered = await discoverTopology(context)
-        var applied = await applyTopology(context, discovered.topology, createClient)
+        var applied = context.options && context.options.masterOnly
+            ? await applyMasterTopology(context, discovered.topology, createClient)
+            : await applyTopology(context, discovered.topology, createClient)
 
         if (applied === context) return context
         return markSentinelUp(applied)
@@ -1068,12 +1104,20 @@ var attachBackground = async (context, options = {}) => {
     })
 }
 
-var createRedis = async (uri, options = {}) => {
+var createRedis = (uri, options = {}) => createInitialContext(uri, options)
+
+var connectRedis = async (context) => {
+    if (!context) throw new Error('connectRedis requires a redis context')
+
+    context = getActiveContext(context)
+
+    var options = context.options || {}
     var createClient = options.createClient || createRedisClient
     var dataCreateClient = options.dataCreateClient || createClient
-    var context = createInitialContext(uri, options)
 
     if (context.mode === 'direct') return connectDirect(context, createClient)
+
+    if (context.mode !== 'sentinel') throw new Error('unknown redis context mode')
 
     context = await connectSentinel(context, createClient)
     context = await discoverTopology(context)
@@ -1081,10 +1125,89 @@ var createRedis = async (uri, options = {}) => {
     return attachBackground(context, options)
 }
 
+var cloneConnectionRecordWithoutClient = (connection) => {
+    if (!connection) return undefined
+
+    return Object.freeze({
+        key: connection.key,
+        role: connection.role,
+        host: connection.host,
+        port: connection.port,
+        client: undefined,
+        status: 'down',
+        failures: 0,
+        retry: createRetryState()
+    })
+}
+
+var cloneRedis = (context) => {
+    context = getActiveContext(context)
+    if (!context) throw new Error('cloneRedis requires a redis context')
+
+    var topology = context.topology
+        ? Object.freeze({
+            master: context.topology.master,
+            replicas: Object.freeze([...(context.topology.replicas || [])])
+        })
+        : undefined
+    var replicas = context.replicas && context.replicas.length
+        ? context.replicas.map(cloneConnectionRecordWithoutClient)
+        : createDisconnectedReplicaRecords((topology && topology.replicas) || [])
+
+    return Object.freeze({
+        mode: context.mode,
+        uri: context.uri,
+        sentinels: Object.freeze([...(context.sentinels || [])]),
+        masterName: context.masterName,
+        username: context.username,
+        password: context.password,
+        sentinel: undefined,
+        sentinelSubscriber: undefined,
+        master: cloneConnectionRecordWithoutClient(context.master),
+        replicas: Object.freeze(replicas),
+        topology,
+        timers: Object.freeze({}),
+        options: Object.freeze({ ...(context.options || {}) })
+    })
+}
+
+var connectMaster = async (context) => {
+    if (!context) throw new Error('connectMaster requires a redis context')
+
+    context = getActiveContext(context)
+
+    var options = context.options || {}
+    var createClient = options.createClient || createRedisClient
+    var dataCreateClient = options.dataCreateClient || createClient
+
+    if (context.mode === 'direct') return connectDirect(context, createClient)
+
+    if (context.mode !== 'sentinel') throw new Error('unknown redis context mode')
+
+    if (!context.sentinel) context = await connectSentinel(context, createClient)
+    context = await discoverTopology(context)
+
+    var master = await connectRedisNode('master', context.topology.master, context, dataCreateClient)
+    context = Object.freeze({
+        ...context,
+        master,
+        replicas: createDisconnectedReplicaRecords(context.topology.replicas || []),
+        options: Object.freeze({
+            ...options,
+            masterOnly: true
+        })
+    })
+
+    return attachBackground(context, context.options)
+}
+
 var closeRedis = async (context) => closeRedisContext(context)
 
 module.exports = {
     createRedis,
+    connectRedis,
+    cloneRedis,
+    connectMaster,
     closeRedis,
     parseRedisUrl,
     createInitialContext,
@@ -1129,10 +1252,12 @@ module.exports = {
     discoverReplicas,
     discoverTopology,
     connectTopology,
+    createDisconnectedReplicaRecords,
     indexConnectionsByKey,
     sameKeys,
     isSameTopology,
     applyTopology,
+    applyMasterTopology,
     isMasterChanged,
     isMasterUnhealthy,
     confirmMasterTopology,

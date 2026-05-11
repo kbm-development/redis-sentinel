@@ -3,6 +3,9 @@
 var assert = require('node:assert/strict')
 var {
     createRedis,
+    connectRedis,
+    cloneRedis,
+    connectMaster,
     closeRedis,
     parseRedisUrl,
     createInitialContext,
@@ -27,7 +30,9 @@ var {
     createRedisNodeClientOptions,
     connectRedisNode,
     connectTopology,
+    createDisconnectedReplicaRecords,
     applyTopology,
+    applyMasterTopology,
     isMasterChanged,
     isMasterUnhealthy,
     handleMasterFailover,
@@ -165,7 +170,23 @@ test('createInitialContext from env REDIS_URL only sentinel', ()=>{
 	assert.equal(1,1) // just pass
 })
 
-test('createRedis public api connects direct mode', async () => {
+test('createRedis returns initial context without connecting', () => {
+    var calls = []
+    var context = createRedis('redis+sentinel://s1.local:26379?sentinelMasterId=mymaster', {
+        createClient: () => {
+            calls.push('create client')
+            return {}
+        }
+    })
+
+    assert.equal(context.mode, 'sentinel')
+    assert.equal(context.sentinel, undefined)
+    assert.equal(context.master, undefined)
+    assert.deepEqual(context.replicas, [])
+    assert.deepEqual(calls, [])
+})
+
+test('connectRedis public api connects direct mode', async () => {
     var calls = []
     var fakeClient = {
         connect: async () => calls.push('connect direct'),
@@ -175,9 +196,10 @@ test('createRedis public api connects direct mode', async () => {
         },
         close: async () => calls.push('close direct')
     }
-    var context = await createRedis('redis://redis.local:6379', {
+    var context = createRedis('redis://redis.local:6379', {
         createClient: () => fakeClient
     })
+    context = await connectRedis(context)
     var result = await command(['GET', 'key'], context)
 
     assert.equal(context.mode, 'direct')
@@ -189,7 +211,7 @@ test('createRedis public api connects direct mode', async () => {
     assert.deepEqual(calls, ['connect direct', ['GET', 'key'], 'close direct'])
 })
 
-test('createRedis public api connects sentinel mode through topology', async () => {
+test('connectRedis public api connects sentinel mode through topology', async () => {
     var calls = []
     var intervals = []
     var clearedIntervals = []
@@ -239,11 +261,15 @@ test('createRedis public api connects sentinel mode through topology', async () 
     }
     var sentinelClients = [sentinelClient, subscriberClient]
     var dataClients = [masterClient, replicaClient]
-    var context = await createRedis('redis+sentinel://s1.local:26379?sentinelMasterId=mymaster', {
+    var context = createRedis('redis+sentinel://s1.local:26379?sentinelMasterId=mymaster', {
         createClient: () => sentinelClients.shift(),
         dataCreateClient: () => dataClients.shift(),
         scheduler
     })
+    assert.equal(intervals.length, 0)
+    assert.deepEqual(calls, [])
+
+    context = await connectRedis(context)
     var writeResult = await command(['SET', 'key', 'value'], context)
     var readResult = await command(['GET', 'key'], context)
 
@@ -282,6 +308,192 @@ test('createRedis public api connects sentinel mode through topology', async () 
         'close replica',
         'close sentinel'
     ])
+})
+
+test('cloneRedis copies topology metadata without live clients or background handles', async () => {
+    var sentinelClient = {
+        connect: async () => undefined,
+        sendCommand: async (args) => {
+            if (args[1] === 'get-master-addr-by-name') return ['master.local', '6379']
+            return [[
+                'ip', 'replica.local',
+                'port', '6379',
+                'flags', 'slave'
+            ]]
+        },
+        close: async () => undefined
+    }
+    var subscriberClient = {
+        connect: async () => undefined,
+        subscribe: async () => undefined,
+        close: async () => undefined
+    }
+    var masterClient = {
+        connect: async () => undefined,
+        close: async () => undefined
+    }
+    var replicaClient = {
+        connect: async () => undefined,
+        close: async () => undefined
+    }
+    var sentinelClients = [sentinelClient, subscriberClient]
+    var dataClients = [masterClient, replicaClient]
+    var context = createRedis('redis+sentinel://s1.local:26379?sentinelMasterId=mymaster', {
+        createClient: () => sentinelClients.shift(),
+        dataCreateClient: () => dataClients.shift()
+    })
+    context = await connectRedis(context)
+    var cloned = cloneRedis(context)
+
+    assert.equal(cloned.mode, context.mode)
+    assert.deepEqual(cloned.sentinels, context.sentinels)
+    assert.deepEqual(cloned.topology, context.topology)
+    assert.equal(cloned.sentinel, undefined)
+    assert.equal(cloned.sentinelSubscriber, undefined)
+    assert.equal(cloned.master.client, undefined)
+    assert.equal(cloned.replicas[0].client, undefined)
+    assert.equal(cloned.topologyReconciler, undefined)
+    assert.equal(cloned.sentinelHealer, undefined)
+    assert.equal(cloned.sentinelEvents, undefined)
+
+    await closeRedis(context)
+})
+
+test('connectMaster connects only sentinel master and starts watching', async () => {
+    var calls = []
+    var intervals = []
+    var sentinelClient = {
+        connect: async () => calls.push('connect sentinel'),
+        sendCommand: async (args) => {
+            calls.push(args)
+            if (args[1] === 'get-master-addr-by-name') return ['master.local', '6379']
+            return [[
+                'ip', 'replica.local',
+                'port', '6379',
+                'flags', 'slave'
+            ]]
+        },
+        close: async () => calls.push('close sentinel')
+    }
+    var subscriberClient = {
+        connect: async () => calls.push('connect subscriber'),
+        subscribe: async channel => calls.push(['subscribe', channel]),
+        close: async () => calls.push('close subscriber')
+    }
+    var masterClient = {
+        connect: async () => calls.push('connect master'),
+        sendCommand: async (args) => {
+            calls.push(['master command', args])
+            return 'ok'
+        },
+        close: async () => calls.push('close master')
+    }
+    var scheduler = {
+        setInterval: (fn, ms) => {
+            var timer = { fn, ms }
+            intervals.push(timer)
+            return timer
+        },
+        clearInterval: () => undefined,
+        setTimeout: (fn, ms) => ({ fn, ms }),
+        clearTimeout: () => undefined
+    }
+    var sentinelClients = [sentinelClient, subscriberClient]
+    var dataClients = [masterClient]
+    var context = createRedis('redis+sentinel://s1.local:26379?sentinelMasterId=mymaster', {
+        createClient: () => sentinelClients.shift(),
+        dataCreateClient: () => dataClients.shift(),
+        scheduler
+    })
+
+    context = await connectMaster(context)
+    var result = await command(['SET', 'key', 'value'], context)
+
+    assert.equal(context.master.client, masterClient)
+    assert.equal(context.replicas[0].client, undefined)
+    assert.equal(context.replicas[0].key, 'replica.local:6379')
+    assert.equal(intervals.length, 2)
+    assert.notEqual(context.topologyReconciler, undefined)
+    assert.notEqual(context.sentinelHealer, undefined)
+    assert.notEqual(context.sentinelEvents, undefined)
+    assert.equal(result, 'ok')
+    assert.deepEqual(calls, [
+        'connect sentinel',
+        ['SENTINEL', 'get-master-addr-by-name', 'mymaster'],
+        ['SENTINEL', 'replicas', 'mymaster'],
+        'connect master',
+        'connect subscriber',
+        ['subscribe', '+switch-master'],
+        ['subscribe', '+slave'],
+        ['subscribe', '+sdown'],
+        ['subscribe', '-sdown'],
+        ['subscribe', '+odown'],
+        ['subscribe', '+failover-end'],
+        ['master command', ['SET', 'key', 'value']]
+    ])
+
+    await closeRedis(context)
+})
+
+test('master-only reconciliation switches master without connecting replicas', async () => {
+    var calls = []
+    var topology = 'old'
+    var sentinelClient = {
+        connect: async () => calls.push('connect sentinel'),
+        sendCommand: async (args) => {
+            calls.push(args)
+            if (args[1] === 'get-master-addr-by-name') {
+                return topology === 'old' ? ['old-master.local', '6379'] : ['new-master.local', '6379']
+            }
+            return [[
+                'ip', 'replica.local',
+                'port', '6379',
+                'flags', 'slave'
+            ]]
+        },
+        close: async () => calls.push('close sentinel')
+    }
+    var subscriberClient = {
+        connect: async () => calls.push('connect subscriber'),
+        subscribe: async channel => calls.push(['subscribe', channel]),
+        close: async () => calls.push('close subscriber')
+    }
+    var oldMasterClient = {
+        connect: async () => calls.push('connect old master'),
+        close: async () => calls.push('close old master')
+    }
+    var newMasterClient = {
+        connect: async () => calls.push('connect new master'),
+        close: async () => calls.push('close new master')
+    }
+    var scheduler = {
+        setInterval: (fn, ms) => ({ fn, ms }),
+        clearInterval: () => undefined,
+        setTimeout: (fn, ms) => ({ fn, ms }),
+        clearTimeout: () => undefined
+    }
+    var sentinelClients = [sentinelClient, subscriberClient]
+    var dataClients = [oldMasterClient, newMasterClient]
+    var context = createRedis('redis+sentinel://s1.local:26379?sentinelMasterId=mymaster', {
+        createClient: () => sentinelClients.shift(),
+        dataCreateClient: () => dataClients.shift(),
+        scheduler
+    })
+
+    context = await connectMaster(context)
+    topology = 'new'
+    context = await context.topologyReconciler.reconcile()
+
+    assert.equal(context.master.key, 'new-master.local:6379')
+    assert.equal(context.master.client, newMasterClient)
+    assert.equal(context.replicas[0].client, undefined)
+    assert.equal(dataClients.length, 0)
+    assert.deepEqual(calls.filter(call => call === 'connect old master' || call === 'connect new master'), [
+        'connect old master',
+        'connect new master'
+    ])
+
+    await closeRedis(context)
 })
 
 
