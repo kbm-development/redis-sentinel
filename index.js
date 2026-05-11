@@ -197,6 +197,54 @@ var createInitialContext = (uri, options = {}) => {
     })
 }
 
+var createRuntimeContext = (context, ready) => {
+    var current = context
+    var runtime = {
+        getContext: () => current,
+        setContext: (nextContext) => {
+            current = nextContext
+            return runtime
+        },
+        ready
+    }
+
+    ;[
+        'mode',
+        'uri',
+        'sentinels',
+        'masterName',
+        'username',
+        'password',
+        'sentinel',
+        'sentinelSubscriber',
+        'sentinelIndex',
+        'sentinelHealth',
+        'sentinelCandidateHealth',
+        'sentinelStatus',
+        'master',
+        'replicas',
+        'topology',
+        'topologyReconciler',
+        'sentinelHealer',
+        'sentinelEvents',
+        'timers',
+        'options',
+        'lastReconcileError'
+    ].forEach((key) => {
+        Object.defineProperty(runtime, key, {
+            enumerable: true,
+            get: () => current[key]
+        })
+    })
+
+    return Object.freeze(runtime)
+}
+
+var setRuntimeContext = (context, nextContext) => {
+    if (context && typeof context.setContext === 'function') return context.setContext(nextContext)
+    return nextContext
+}
+
 var createRedisClient = (options) => redis.createClient(options)
 
 var createConnectionRecord = (role, key, client, node = {}, status = 'up') => {
@@ -940,10 +988,18 @@ var createSentinelEventSubscription = async (context, reconciler, options = {}) 
 }
 
 var getDirectClient = (context) => {
+    if (!context.master || !context.master.client) {
+        throw new Error('direct redis context is not connected')
+    }
+
     return context.master.client
 }
 
 var getMasterClient = (context) => {
+    if (!context.master || !context.master.client) {
+        throw new Error('sentinel redis context master is not connected')
+    }
+
     return context.master.client
 }
 
@@ -1057,26 +1113,104 @@ var attachBackground = async (context, options = {}) => {
     })
 }
 
-var createRedis = async (uri, options = {}) => {
+var discoverRedis = async (context, options = {}) => {
     var createClient = options.createClient || createRedisClient
-    var dataCreateClient = options.dataCreateClient || createClient
+
+    if (context.mode === 'direct') return context
+
+    var active = context.sentinel ? context : await connectSentinel(context, createClient)
+    return discoverTopology(active)
+}
+
+var createRedis = (uri, options = {}) => {
     var context = createInitialContext(uri, options)
+    var runtime = undefined
+    var ready = discoverRedis(context, options).then((nextContext) => {
+        setRuntimeContext(runtime, nextContext)
+        return runtime
+    })
 
-    if (context.mode === 'direct') return connectDirect(context, createClient)
+    runtime = createRuntimeContext(context, ready)
 
-    context = await connectSentinel(context, createClient)
-    context = await discoverTopology(context)
-    context = await connectTopology(context, dataCreateClient)
-    return attachBackground(context, options)
+    return runtime
+}
+
+var connectMasterRedis = async (context, options = {}) => {
+    var active = await (context && context.ready ? context.ready : Promise.resolve(context))
+    active = getActiveContext(active)
+
+    var createClient = options.createClient || options.dataCreateClient || active.options.dataCreateClient || active.options.createClient || createRedisClient
+    var nextContext = undefined
+
+    if (active.mode === 'direct') {
+        nextContext = await connectDirect(active, createClient)
+        return setRuntimeContext(context, nextContext)
+    }
+
+    if (!active.topology || !active.topology.master) {
+        active = await discoverRedis(active, { ...active.options, ...options })
+    }
+
+    var master = await connectRedisNode('master', active.topology.master, active, createClient)
+    nextContext = Object.freeze({
+        ...active,
+        master,
+        replicas: Object.freeze([])
+    })
+
+    return setRuntimeContext(context, nextContext)
+}
+
+var connectRedis = async (context, options = {}) => {
+    var active = await (context && context.ready ? context.ready : Promise.resolve(context))
+    active = getActiveContext(active)
+
+    var createClient = options.createClient || active.options.createClient || createRedisClient
+    var dataCreateClient = options.dataCreateClient || active.options.dataCreateClient || createClient
+    var nextContext = undefined
+
+    if (active.mode === 'direct') {
+        nextContext = active.master ? active : await connectDirect(active, createClient)
+        return setRuntimeContext(context, nextContext)
+    }
+
+    if (!active.sentinel) active = await connectSentinel(active, createClient)
+    if (!active.topology || !active.topology.master) active = await discoverTopology(active)
+
+    nextContext = active.master ? active : await connectTopology(active, dataCreateClient)
+    nextContext = await attachBackground(nextContext, { ...active.options, ...options })
+
+    return setRuntimeContext(context, nextContext)
+}
+
+var cloneRedis = (context, options = {}) => {
+    var active = getActiveContext(context)
+    var nextContext = createInitialContext(active.uri, {
+        ...active.options,
+        ...options
+    })
+
+    if (active.topology) {
+        nextContext = Object.freeze({
+            ...nextContext,
+            topology: active.topology
+        })
+    }
+
+    return createRuntimeContext(nextContext, Promise.resolve(nextContext))
 }
 
 var closeRedis = async (context) => closeRedisContext(context)
 
 module.exports = {
     createRedis,
+    connectRedis,
+    connectMasterRedis,
+    cloneRedis,
     closeRedis,
     parseRedisUrl,
     createInitialContext,
+    createRuntimeContext,
     parseSentinelNode,
     parsePort,
     createRedisClient,
@@ -1141,6 +1275,7 @@ module.exports = {
     subscribeSentinelChannels,
     createDebouncedReconcile,
     createSentinelEventSubscription,
+    discoverRedis,
     READ_COMMANDS,
     WRITE_COMMANDS,
     classifyCommand,

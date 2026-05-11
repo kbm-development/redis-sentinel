@@ -58,9 +58,14 @@ npm install git+https://github.com/kbm-development/redis-sentinel.git
 Create the Redis context once during application startup.
 
 ```js
-var { createRedis, command, closeRedis } = require('redis-sentinel')
+var { createRedis, connectRedis, command, closeRedis } = require('redis-sentinel')
 
-var redis = await createRedis(process.env.REDIS_URL)
+var redis = createRedis(process.env.REDIS_URL)
+
+await redis.ready
+console.log(redis.topology.master)
+
+await connectRedis(redis)
 
 await command(['SET', 'key', 'value'], redis)
 var value = await command(['GET', 'key'], redis)
@@ -68,21 +73,26 @@ var value = await command(['GET', 'key'], redis)
 await closeRedis(redis)
 ```
 
-Blocking stream readers should use their own Redis client instead of duplicating the shared command client. Create the main context first, then start stream readers from the discovered master address:
+Blocking stream readers should use their own Redis context instead of duplicating the shared command client. Clone the discovered context and connect only its master connection:
 
 ```js
-var redis = await createRedis(process.env.REDIS_URL)
+var { createRedis, connectRedis, connectMasterRedis, cloneRedis } = require('redis-sentinel')
 
-startStreams(redis)
+var redis = createRedis(process.env.REDIS_URL)
+
+await redis.ready
+await connectRedis(redis)
+
+var streamRedis = cloneRedis(redis)
+await connectMasterRedis(streamRedis)
+
+startStreams(streamRedis)
 ```
 
-The stream reader can create a separate client from the active master node. This keeps blocking commands off the shared command connection and avoids depending on `context.master.client.duplicate()` during startup:
+The stream reader can keep using `command(args, streamRedis)`. This keeps blocking commands off the shared command connection and avoids depending on `context.master.client.duplicate()` during startup:
 
 ```js
-var context = getActiveContext(redis)
-var streamClient = createRedisClient(createRedisNodeClientOptions(context.master, context))
-
-await streamClient.connect()
+await command(['XREADGROUP', 'GROUP', group, consumer, 'BLOCK', '0', 'STREAMS', key, '>'], streamRedis)
 ```
 
 ## Connection Strings
@@ -114,17 +124,23 @@ The Sentinel URI points to Sentinel nodes, not Redis master or replica nodes.
 - Reads go to a healthy replica when available.
 - Reads fall back to master if no healthy replica exists.
 - Unknown commands are treated as writes and sent to master.
-- Background reconciliation keeps topology fresh.
+- `createRedis()` starts Sentinel discovery but does not start data-plane Redis connections or background watchers.
+- `connectRedis()` connects master/replica data-plane clients and starts background reconciliation/watchers.
+- Background reconciliation keeps topology fresh after `connectRedis()`.
 - Sentinel pub/sub events trigger debounced reconciliation.
 - Sentinel failures do not kill active master/replica connections.
 - Failed foreground commands are returned to the caller without automatic retry.
 
 ## Lifecycle
 
-- `await createRedis(url)` connects Redis and returns the ready context.
+- `createRedis(url)` returns a stable context reference immediately.
+- `redis.ready` resolves after Sentinel discovery has populated `redis.topology`.
+- `connectRedis(redis)` connects the shared master/replica clients and starts background work.
+- `cloneRedis(redis)` creates a separate context from the same discovered topology.
+- `connectMasterRedis(clone)` connects only the clone's master client, which is useful for blocking stream readers.
 - `command(args, redis)` routes through the shared command connections.
-- Blocking stream readers should create their own Redis client to the active master instead of using `.duplicate()` on `context.master.client`.
-- `closeRedis(redis)` closes Redis, Sentinel, background, and subscriber resources owned by the shared context. Stream reader clients created separately should be closed by the stream adapter.
+- Blocking stream readers should use a cloned master-only context instead of using `.duplicate()` on `context.master.client`.
+- `closeRedis(redis)` closes Redis, Sentinel, background, and subscriber resources owned by that context.
 
 ## Deployment Note
 
