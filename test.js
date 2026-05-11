@@ -54,6 +54,7 @@ var {
     createSentinelHealer,
     classifyCommand,
     chooseReplica,
+    isRedisClient,
     command,
     closeRedisContext
 } = require('./index')
@@ -2047,6 +2048,26 @@ test('chooseReplica returns first healthy replica', () => {
     var context = Object.freeze({ replicas: Object.freeze([first, second, third]) })
 
     assert.equal(chooseReplica(context), second)
+})
+
+test('isRedisClient detects raw node redis style clients', () => {
+    assert.equal(isRedisClient({ sendCommand: async () => undefined }), true)
+    assert.equal(isRedisClient({ master: { client: {} } }), false)
+    assert.equal(isRedisClient(undefined), false)
+})
+
+test('command sends directly to raw redis clients', async () => {
+    var sentArgs = undefined
+    var rawClient = {
+        sendCommand: async (args) => {
+            sentArgs = args
+            return 'raw-value'
+        }
+    }
+    var result = await command(['GET', 'key'], rawClient)
+
+    assert.equal(result, 'raw-value')
+    assert.deepEqual(sentArgs, ['GET', 'key'])
 })
 
 test('sentinel command routes writes to master', async () => {

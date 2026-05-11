@@ -975,8 +975,12 @@ var createSentinelEventSubscription = async (context, reconciler, options = {}) 
 }
 
 var getDirectClient = (context) => {
+    if (!context || context.mode !== 'direct') {
+        throw new Error('direct command requires a direct redis context')
+    }
+
     if (!context.master || !context.master.client) {
-        //throw new Error('direct redis context is not connected')
+        throw new Error('direct redis context is not connected')
     }
 
     return context.master.client
@@ -984,7 +988,7 @@ var getDirectClient = (context) => {
 
 var getMasterClient = (context) => {
     if (!context.master || !context.master.client) {
-        //throw new Error('sentinel redis context master is not connected')
+        throw new Error('sentinel redis context master is not connected')
     }
 
     return context.master.client
@@ -1013,8 +1017,14 @@ var getActiveContext = (context) => {
     return context
 }
 
+var isRedisClient = (value) => {
+    return Boolean(value && typeof value.sendCommand === 'function')
+}
+
 var getCommandClient = (args, context) => {
     context = getActiveContext(context)
+
+    if (isRedisClient(context)) return context
 
     if (context.mode === 'direct') return getDirectClient(context)
 
@@ -1277,6 +1287,7 @@ module.exports = {
     classifyCommand,
     isHealthyConnection,
     chooseReplica,
+    isRedisClient,
     getCommandClient,
     getActiveContext,
     attachBackground,
