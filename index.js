@@ -197,54 +197,6 @@ var createInitialContext = (uri, options = {}) => {
     })
 }
 
-var createRuntimeContext = (context, ready) => {
-    var current = context
-    var runtime = {
-        getContext: () => current,
-        setContext: (nextContext) => {
-            current = nextContext
-            return runtime
-        },
-        ready
-    }
-
-    ;[
-        'mode',
-        'uri',
-        'sentinels',
-        'masterName',
-        'username',
-        'password',
-        'sentinel',
-        'sentinelSubscriber',
-        'sentinelIndex',
-        'sentinelHealth',
-        'sentinelCandidateHealth',
-        'sentinelStatus',
-        'master',
-        'replicas',
-        'topology',
-        'topologyReconciler',
-        'sentinelHealer',
-        'sentinelEvents',
-        'timers',
-        'options',
-        'lastReconcileError'
-    ].forEach((key) => {
-        Object.defineProperty(runtime, key, {
-            enumerable: true,
-            get: () => current[key]
-        })
-    })
-
-    return Object.freeze(runtime)
-}
-
-var setRuntimeContext = (context, nextContext) => {
-    if (context && typeof context.setContext === 'function') return context.setContext(nextContext)
-    return nextContext
-}
-
 var createRedisClient = (options) => redis.createClient(options)
 
 var createConnectionRecord = (role, key, client, node = {}, status = 'up') => {
@@ -1021,14 +973,7 @@ var chooseReplica = (context) => {
     return (context.replicas || []).find(isHealthyConnection)
 }
 
-var getActiveContext = (context) => {
-    if (context && typeof context.getContext === 'function') return context.getContext()
-    return context
-}
-
 var getCommandClient = (args, context) => {
-    context = getActiveContext(context)
-
     if (context.mode === 'direct') return getDirectClient(context)
 
     var type = classifyCommand(args)
@@ -1046,7 +991,6 @@ var command = async (args, context) => {
         throw new Error('command args must be a non-empty array')
     }
 
-    context = getActiveContext(context)
     var client = getCommandClient(args, context)
     return client.sendCommand(args)
 }
@@ -1071,8 +1015,6 @@ var closeRedisContext = async (context) => {
     if (context.topologyReconciler) context.topologyReconciler.stop()
     if (context.sentinelHealer) context.sentinelHealer.stop()
     if (context.sentinelEvents) await context.sentinelEvents.stop()
-
-    context = getActiveContext(context)
 
     if (context.master) await closeClient(context.master.client)
 
@@ -1108,8 +1050,7 @@ var attachBackground = async (context, options = {}) => {
         sentinelSubscriber: sentinelEvents.context.sentinelSubscriber,
         topologyReconciler,
         sentinelHealer,
-        sentinelEvents,
-        getContext: () => topologyReconciler.getContext()
+        sentinelEvents
     })
 }
 
@@ -1124,20 +1065,16 @@ var discoverRedis = async (context, options = {}) => {
 
 var createRedis = (uri, options = {}) => {
     var context = createInitialContext(uri, options)
-    var runtime = undefined
-    var ready = discoverRedis(context, options).then((nextContext) => {
-        setRuntimeContext(runtime, nextContext)
-        return runtime
+    var ready = discoverRedis(context, options)
+
+    return Object.freeze({
+        ...context,
+        ready
     })
-
-    runtime = createRuntimeContext(context, ready)
-
-    return runtime
 }
 
 var connectMasterRedis = async (context, options = {}) => {
     var active = await (context && context.ready ? context.ready : Promise.resolve(context))
-    active = getActiveContext(active)
 
     if (!active || !active.uri) {
         throw new Error('connectMasterRedis requires a redis context returned by createRedis')
@@ -1148,7 +1085,7 @@ var connectMasterRedis = async (context, options = {}) => {
 
     if (active.mode === 'direct') {
         nextContext = await connectDirect(active, createClient)
-        return setRuntimeContext(context, nextContext)
+        return nextContext
     }
 
     if (!active.topology || !active.topology.master) {
@@ -1162,12 +1099,11 @@ var connectMasterRedis = async (context, options = {}) => {
         replicas: Object.freeze([])
     })
 
-    return setRuntimeContext(context, nextContext)
+    return nextContext
 }
 
 var connectRedis = async (context, options = {}) => {
     var active = await (context && context.ready ? context.ready : Promise.resolve(context))
-    active = getActiveContext(active)
 
     if (!active || !active.uri) {
         throw new Error('connectRedis requires a redis context returned by createRedis')
@@ -1179,7 +1115,7 @@ var connectRedis = async (context, options = {}) => {
 
     if (active.mode === 'direct') {
         nextContext = active.master ? active : await connectDirect(active, createClient)
-        return setRuntimeContext(context, nextContext)
+        return nextContext
     }
 
     if (!active.sentinel) active = await connectSentinel(active, createClient)
@@ -1188,11 +1124,11 @@ var connectRedis = async (context, options = {}) => {
     nextContext = active.master ? active : await connectTopology(active, dataCreateClient)
     nextContext = await attachBackground(nextContext, { ...active.options, ...options })
 
-    return setRuntimeContext(context, nextContext)
+    return nextContext
 }
 
 var cloneRedis = (context, options = {}) => {
-    var active = getActiveContext(context)
+    var active = context
 
     if (!active || !active.uri) {
         throw new Error('cloneRedis requires a redis context returned by createRedis, not a Promise or empty value')
@@ -1210,7 +1146,10 @@ var cloneRedis = (context, options = {}) => {
         })
     }
 
-    return createRuntimeContext(nextContext, Promise.resolve(nextContext))
+    return Object.freeze({
+        ...nextContext,
+        ready: Promise.resolve(nextContext)
+    })
 }
 
 var closeRedis = async (context) => closeRedisContext(context)
@@ -1226,7 +1165,6 @@ module.exports = {
     closeRedis,
     parseRedisUrl,
     createInitialContext,
-    createRuntimeContext,
     parseSentinelNode,
     parsePort,
     createRedisClient,
@@ -1298,7 +1236,6 @@ module.exports = {
     isHealthyConnection,
     chooseReplica,
     getCommandClient,
-    getActiveContext,
     attachBackground,
     command,
     closeRedisContext

@@ -55,17 +55,17 @@ npm install git+https://github.com/kbm-development/redis-sentinel.git
 
 ## Usage
 
-Create the Redis context once during application startup.
+Create the Redis context once during application startup. `createRedis()` returns a plain context object immediately. Lifecycle functions are functional: they take a context and return the next context.
 
 ```js
 var { createRedis, connectRedis, command, closeRedis } = require('redis-sentinel')
 
 var redis = createRedis(process.env.REDIS_URL)
 
-await redis.ready
-console.log(redis.topology.master)
+var discovered = await redis.ready
+console.log(discovered.topology.master)
 
-await connectRedis(redis)
+redis = await connectRedis(discovered)
 
 await command(['SET', 'key', 'value'], redis)
 var value = await command(['GET', 'key'], redis)
@@ -80,11 +80,11 @@ var { createRedis, connectRedis, connectMasterRedis, cloneRedis } = require('red
 
 var redis = createRedis(process.env.REDIS_URL)
 
-await redis.ready
-await connectRedis(redis)
+var discovered = await redis.ready
+redis = await connectRedis(discovered)
 
 var streamRedis = cloneRedis(redis)
-await connectMasterRedis(streamRedis)
+streamRedis = await connectMasterRedis(streamRedis)
 
 startStreams(streamRedis)
 ```
@@ -133,11 +133,12 @@ The Sentinel URI points to Sentinel nodes, not Redis master or replica nodes.
 
 ## Lifecycle
 
-- `createRedis(url)` returns a stable context reference immediately.
-- `redis.ready` resolves after Sentinel discovery has populated `redis.topology`.
-- `connectRedis(redis)` connects the shared master/replica clients and starts background work.
+- `createRedis(url)` returns a plain context object immediately.
+- The returned context has no object methods like `getContext()` or `setContext()`.
+- `redis.ready` resolves to a new discovered context with `topology` populated.
+- `connectRedis(redis)` returns a new context with shared master/replica clients and background work started.
 - `cloneRedis(redis)` creates a separate context from the same discovered topology.
-- `connectMasterRedis(clone)` connects only the clone's master client, which is useful for blocking stream readers.
+- `connectMasterRedis(clone)` returns a new context with only the clone's master client connected, which is useful for blocking stream readers.
 - `command(args, redis)` routes through the shared command connections.
 - Blocking stream readers should use a cloned master-only context instead of using `.duplicate()` on `context.master.client`.
 - `closeRedis(redis)` closes Redis, Sentinel, background, and subscriber resources owned by that context.

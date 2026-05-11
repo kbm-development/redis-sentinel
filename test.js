@@ -187,16 +187,18 @@ test('createRedis public api returns direct context immediately and connectRedis
 
     assert.equal(context.mode, 'direct')
     assert.equal(context.master, undefined)
+    assert.equal(context.getContext, undefined)
 
-    await connectRedis(context)
+    var connected = await connectRedis(context)
 
-    var result = await command(['GET', 'key'], context)
+    var connectedResult = await command(['GET', 'key'], connected)
 
     assert.equal(context.mode, 'direct')
-    assert.equal(context.master.client, fakeClient)
-    assert.equal(result, 'direct-value')
+    assert.equal(context.master, undefined)
+    assert.equal(connected.master.client, fakeClient)
+    assert.equal(connectedResult, 'direct-value')
 
-    await closeRedis(context)
+    await closeRedis(connected)
 
     assert.deepEqual(calls, ['connect direct', ['GET', 'key'], 'close direct'])
 })
@@ -259,32 +261,39 @@ test('createRedis public api discovers sentinel topology before connectRedis sta
 
     assert.equal(context.mode, 'sentinel')
     assert.equal(context.master, undefined)
+    assert.equal(context.getContext, undefined)
 
-    await context.ready
+    var discovered = await context.ready
 
-    assert.equal(context.sentinel, sentinelClient)
-    assert.equal(context.topology.master.host, 'master.local')
-    assert.equal(context.topology.replicas[0].host, 'replica.local')
+    assert.equal(context.sentinel, undefined)
+    assert.equal(context.topology, undefined)
+    assert.equal(discovered.sentinel, sentinelClient)
+    assert.equal(discovered.topology.master.host, 'master.local')
+    assert.equal(discovered.topology.replicas[0].host, 'replica.local')
     assert.equal(intervals.length, 0)
 
-    await connectRedis(context)
+    var connected = await connectRedis(context)
 
-    var writeResult = await command(['SET', 'key', 'value'], context)
-    var readResult = await command(['GET', 'key'], context)
+    assert.notEqual(connected, context)
+    assert.equal(connected.getContext, undefined)
+
+    var writeResult = await command(['SET', 'key', 'value'], connected)
+    var readResult = await command(['GET', 'key'], connected)
 
     assert.equal(context.mode, 'sentinel')
-    assert.equal(context.sentinel, sentinelClient)
-    assert.equal(context.sentinelSubscriber, subscriberClient)
-    assert.equal(context.master.client, masterClient)
-    assert.equal(context.replicas[0].client, replicaClient)
-    assert.notEqual(context.topologyReconciler, undefined)
-    assert.notEqual(context.sentinelHealer, undefined)
-    assert.notEqual(context.sentinelEvents, undefined)
+    assert.equal(context.sentinel, undefined)
+    assert.equal(connected.sentinel, sentinelClient)
+    assert.equal(connected.sentinelSubscriber, subscriberClient)
+    assert.equal(connected.master.client, masterClient)
+    assert.equal(connected.replicas[0].client, replicaClient)
+    assert.notEqual(connected.topologyReconciler, undefined)
+    assert.notEqual(connected.sentinelHealer, undefined)
+    assert.notEqual(connected.sentinelEvents, undefined)
     assert.equal(intervals.length, 2)
     assert.equal(writeResult, 'ok')
     assert.equal(readResult, 'value')
 
-    await closeRedis(context)
+    await closeRedis(connected)
 
     assert.equal(clearedIntervals.length, 2)
     assert.deepEqual(calls, [
@@ -333,17 +342,18 @@ test('cloneRedis creates separate master-only context for stream readers', async
         dataCreateClient: () => masterClient
     })
 
-    await context.ready
+    var discovered = await context.ready
 
-    var streamContext = cloneRedis(context)
-    await connectMasterRedis(streamContext)
+    var streamContext = cloneRedis(discovered)
+    var connectedStreamContext = await connectMasterRedis(streamContext)
 
     assert.equal(streamContext.topology.master.host, 'master.local')
-    assert.equal(streamContext.master.client, masterClient)
-    assert.equal(await command(['XREADGROUP', 'GROUP', 'g', 'c', 'STREAMS', 's', '>'], streamContext), 'stream-value')
+    assert.equal(streamContext.master, undefined)
+    assert.equal(connectedStreamContext.master.client, masterClient)
+    assert.equal(await command(['XREADGROUP', 'GROUP', 'g', 'c', 'STREAMS', 's', '>'], connectedStreamContext), 'stream-value')
 
-    await closeRedis(streamContext)
-    await closeRedis(context)
+    await closeRedis(connectedStreamContext)
+    await closeRedis(discovered)
 
     assert.deepEqual(calls, [
         'connect sentinel',
@@ -373,15 +383,15 @@ test('connect and clone aliases support migration adapter names', async () => {
         createClient: () => clients.shift()
     })
 
-    await connect(context)
+    var connected = await connect(context)
 
-    var streamContext = clone(context)
-    await connectMaster(streamContext)
+    var streamContext = clone(connected)
+    var connectedStreamContext = await connectMaster(streamContext)
 
-    assert.equal(await command(['GET', 'key'], streamContext), 'stream-ok')
+    assert.equal(await command(['GET', 'key'], connectedStreamContext), 'stream-ok')
 
-    await closeRedis(streamContext)
-    await closeRedis(context)
+    await closeRedis(connectedStreamContext)
+    await closeRedis(connected)
 
     assert.deepEqual(calls, [
         'connect direct',
