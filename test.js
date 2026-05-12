@@ -2120,6 +2120,32 @@ test('sentinel command routes reads to healthy replica', async () => {
     assert.deepEqual(calls, [['replica', ['GET', 'key']]])
 })
 
+test('sentinel command routes reads to master when forceWrite is enabled', async () => {
+    var calls = []
+    var masterClient = {
+        sendCommand: async (args) => {
+            calls.push(['master', args])
+            return 'master-value'
+        }
+    }
+    var replicaClient = {
+        sendCommand: async (args) => {
+            calls.push(['replica', args])
+            return 'replica-value'
+        }
+    }
+    var context = Object.freeze({
+        mode: 'sentinel',
+        options: Object.freeze({ forceWrite: true }),
+        master: { status: 'up', client: masterClient },
+        replicas: Object.freeze([{ status: 'up', client: replicaClient }])
+    })
+    var result = await command(['GET', 'key'], context)
+
+    assert.equal(result, 'master-value')
+    assert.deepEqual(calls, [['master', ['GET', 'key']]])
+})
+
 test('sentinel command falls back reads to master when no healthy replica', async () => {
     var calls = []
     var masterClient = {

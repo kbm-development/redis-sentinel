@@ -1028,6 +1028,12 @@ var getCommandClient = (args, context) => {
 
     if (context.mode === 'direct') return getDirectClient(context)
 
+    if (context.mode !== 'sentinel') {
+        throw new Error('unknown redis context mode')
+    }
+
+    if (context.options && context.options.forceWrite) return getMasterClient(context)
+
     var type = classifyCommand(args)
     if (type === 'read') {
         var replica = chooseReplica(context)
